@@ -1,5 +1,23 @@
 # Session Handoff
 
+## Last Session (2026-10-16) - load any GGUF + one model picker + token readouts
+
+**Done:**
+- `POST /api/model/load` accepts any GGUF (pinned target is advisory, still
+  reported as `compatible`); startup auto-load falls back to the newest GGUF.
+- Restored `ggufloader/config/model_families.json` (it was gitignored away by
+  an unanchored `config/` rule) + package-data; generic families got an agent
+  system prompt so non-gemma models can run agent mode.
+- Shared `frontend/src/components/model/ModelPicker.tsx` used by chat AND agent
+  mode; chatbot token readouts moved above the prompt box with prompt/total/
+  session counts.
+- `quick_profile` reports quantization + context length; `testingApi` added to
+  the API client (the missing export broke `tsc -b`).
+
+**Verified:** `pytest tests/unit` 624 passed / 4 pre-existing env failures;
+`tsc -b` + `vite build` clean. **Open:** real multi-GB model load on a machine
+with `llama-cpp-python` installed.
+
 ## Current Objective
 
 - Goal: Improve GGUFLoader agent mode to match production harnesses (Codex CLI, Mini-Coding-Agent)

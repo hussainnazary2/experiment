@@ -1,23 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { playgroundApi } from '../../api/client'
 import { MarkdownRenderer } from './MarkdownRenderer'
-import { Send, Square, Trash2, RefreshCw, Cpu, Zap, Timer, Hash, Gauge } from 'lucide-react'
+import { ModelPicker } from '../model/ModelPicker'
+import { Send, Square, Trash2, Zap, Gauge, Hash, Cpu } from 'lucide-react'
 
 /**
  * A plain streaming chatbot - no agent, no tools, no plans.
  *
  * Everything a viewer needs is on screen: the reply streams in token by
- * token, and big readouts show tokens/sec, how many tokens were generated,
- * time-to-first-token and elapsed time.
+ * token, and two oversized readouts sit directly above the prompt box -
+ * decode speed (tok/s) and the total token count for the turn. Model
+ * selection uses the same picker as agent mode.
  */
-
-interface Candidate {
-  path: string
-  filename: string
-  size_human: string
-  quantization: string
-  architecture: string
-}
 
 interface Msg {
   role: 'user' | 'assistant'
@@ -25,42 +19,41 @@ interface Msg {
 }
 
 interface Stats {
+  prompt_tokens?: number
   tokens_generated: number
+  total_tokens?: number
   elapsed_ms: number
   ttft_ms: number
   tokens_per_second: number
   total_tokens_per_second?: number
 }
 
-function StatCard({ icon, label, value, unit, accent }: {
+/** One large readout in the strip above the prompt box. */
+function StatChip({ icon, label, value, accent, title }: {
   icon: React.ReactNode
   label: string
   value: string
-  unit?: string
   accent?: boolean
+  title?: string
 }) {
   return (
-    <div className={`flex-1 min-w-0 rounded-lg border px-3 py-2 ${accent ? 'border-accent/40 bg-accent/10' : 'border-border bg-elevated'}`}>
-      <div className={`flex items-center gap-1 text-[10px] uppercase tracking-wide ${accent ? 'text-accent' : 'text-text-muted'}`}>
-        {icon}
-        <span className="truncate">{label}</span>
-      </div>
-      <div className="flex items-baseline gap-1 mt-0.5">
-        <span className={`font-mono tabular-nums text-2xl leading-none font-semibold ${accent ? 'text-accent' : 'text-text'}`}>
-          {value}
-        </span>
-        {unit && <span className="text-[10px] text-text-muted">{unit}</span>}
-      </div>
+    <div
+      title={title}
+      className={`flex items-baseline gap-2 rounded-xl border px-4 py-2.5 ${
+        accent ? 'border-accent/40 bg-accent/10' : 'border-border bg-elevated'
+      }`}
+    >
+      <span className={`self-center ${accent ? 'text-accent' : 'text-text-muted'}`}>{icon}</span>
+      <span className={`font-mono tabular-nums text-2xl font-bold leading-none ${accent ? 'text-accent' : 'text-text'}`}>
+        {value}
+      </span>
+      <span className="text-[10px] font-semibold uppercase tracking-wider text-text-muted leading-none">{label}</span>
     </div>
   )
 }
 
 export function PlaygroundChat() {
-  const [candidates, setCandidates] = useState<Candidate[]>([])
-  const [selected, setSelected] = useState('')
   const [loaded, setLoaded] = useState<any>(null)
-  const [loadingModel, setLoadingModel] = useState(false)
-  const [loadingList, setLoadingList] = useState(true)
   const [messages, setMessages] = useState<Msg[]>([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
@@ -71,15 +64,6 @@ export function PlaygroundChat() {
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
-  const loadList = useCallback(async () => {
-    setLoadingList(true)
-    try {
-      const data = await playgroundApi.models()
-      setCandidates(data.models || [])
-    } catch { /* ok */ }
-    setLoadingList(false)
-  }, [])
-
   const refreshStatus = useCallback(async () => {
     try {
       const s = await playgroundApi.status()
@@ -88,28 +72,14 @@ export function PlaygroundChat() {
   }, [])
 
   useEffect(() => {
-    void loadList()
     void refreshStatus()
-  }, [loadList, refreshStatus])
+  }, [refreshStatus])
 
   // Keep the newest tokens in view while streaming.
   useEffect(() => {
     const el = scrollRef.current
     if (el && generating) el.scrollTop = el.scrollHeight
   }, [messages, generating])
-
-  const doLoad = async () => {
-    if (!selected) return
-    setLoadingModel(true)
-    setError(null)
-    try {
-      const info = await playgroundApi.load(selected)
-      setLoaded(info)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load model')
-    }
-    setLoadingModel(false)
-  }
 
   const send = async () => {
     const text = input.trim()
@@ -152,7 +122,8 @@ export function PlaygroundChat() {
             next[next.length - 1] = { role: 'assistant', content: acc }
             return next
           })
-          setStats(ev.data as Stats)
+          const final = ev.data as Stats
+          setStats(final)
         } else if (ev.type === 'error') {
           setError(ev.data.message || 'Generation failed')
         }
@@ -176,88 +147,19 @@ export function PlaygroundChat() {
     setError(null)
   }
 
-  const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`)
-
   return (
     <div className="h-full flex flex-col bg-bg">
-      {/* Model bar */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-surface">
-        <Cpu size={14} className="text-text-muted flex-shrink-0" />
-        <select
-          value={selected}
-          onChange={(e) => setSelected(e.target.value)}
-          disabled={generating || loadingModel}
-          className="flex-1 min-w-0 bg-elevated border border-border rounded-lg px-2 py-1.5 text-xs text-text focus:outline-none focus:border-accent/50"
-        >
-          <option value="">
-            {loadingList ? 'Scanning for GGUF models…' : candidates.length ? 'Select a model…' : 'No GGUF models found'}
-          </option>
-          {candidates.map((c) => (
-            <option key={c.path} value={c.path}>
-              {c.filename} ({c.size_human})
-            </option>
-          ))}
-        </select>
-        <button
-          onClick={doLoad}
-          disabled={!selected || loadingModel || generating}
-          className="flex items-center gap-1.5 text-[11px] font-medium px-3 py-1.5 rounded-lg bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40 transition-colors"
-        >
-          {loadingModel ? <RefreshCw size={12} className="animate-spin" /> : <Zap size={12} />}
-          Load
-        </button>
-        <button
-          onClick={() => { void loadList(); void refreshStatus() }}
-          title="Rescan models"
-          className="p-1.5 text-text-muted hover:text-text rounded-lg hover:bg-elevated transition-colors"
-        >
-          <RefreshCw size={13} className={loadingList ? 'animate-spin' : ''} />
-        </button>
-      </div>
-
-      {/* Model chip */}
-      {loaded && (
-        <div className="flex items-center gap-2 px-3 py-1.5 text-[10px] text-text-muted border-b border-border">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
-          <span className="text-text truncate">{loaded.filename}</span>
-          {loaded.quantization && <span className="px-1.5 py-0.5 rounded bg-elevated border border-border">{loaded.quantization}</span>}
-          {loaded.n_ctx && <span>ctx {loaded.n_ctx}</span>}
-          <span className="ml-auto">{loaded.use_gpu ? 'GPU' : 'CPU'}</span>
-        </div>
-      )}
-
-      {/* Live stats - the whole point: a viewer must see the speed */}
-      <div className="flex gap-2 px-3 py-2 border-b border-border bg-surface/60">
-        <StatCard
-          icon={<Gauge size={11} />}
-          label="Tokens / sec"
-          value={stats ? stats.tokens_per_second.toFixed(1) : '—'}
-          accent
-        />
-        <StatCard
-          icon={<Hash size={11} />}
-          label="Tokens generated"
-          value={stats ? String(stats.tokens_generated) : '0'}
-        />
-        <StatCard
-          icon={<Timer size={11} />}
-          label="First token"
-          value={stats ? fmtMs(stats.ttft_ms) : '—'}
-        />
-        <StatCard
-          icon={<Timer size={11} />}
-          label="Elapsed"
-          value={stats ? fmtMs(stats.elapsed_ms) : '—'}
-        />
-      </div>
-
       {/* Conversation */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
         {messages.length === 0 && !error && (
           <div className="h-full flex flex-col items-center justify-center text-center text-text-muted">
             <Zap size={26} className="mb-3 opacity-30" />
-            <p className="text-sm">Load a model, then type a message.</p>
-            <p className="text-xs mt-1 opacity-70">Tokens stream here with live tokens/sec and a token counter.</p>
+            <p className="text-sm">
+              {loaded ? 'Type a message to start chatting.' : 'Pick a model below, then type a message.'}
+            </p>
+            <p className="text-xs mt-1 opacity-70">
+              Tokens stream here with live tokens/sec and a token counter above the prompt box.
+            </p>
           </div>
         )}
 
@@ -295,8 +197,24 @@ export function PlaygroundChat() {
         )}
       </div>
 
-      {/* Composer */}
+      {/* Composer: token readouts sit directly above the prompt box. */}
       <div className="border-t border-border bg-surface px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          <StatChip
+            icon={<Gauge size={18} />}
+            label="tok/s"
+            value={stats ? stats.tokens_per_second.toFixed(1) : '—'}
+            accent
+            title="Decode speed (tokens per second since the first token)"
+          />
+          <StatChip
+            icon={<Hash size={18} />}
+            label="total tokens"
+            value={stats ? String(stats.total_tokens ?? stats.tokens_generated) : '0'}
+            title="Prompt + generated tokens for this turn"
+          />
+        </div>
+
         <div className="flex items-end gap-2">
           <textarea
             value={input}
@@ -308,9 +226,16 @@ export function PlaygroundChat() {
               }
             }}
             rows={2}
-            placeholder={loaded ? 'Type a message…  (Enter to send)' : 'Load a model to start chatting'}
+            placeholder={loaded ? 'Type a message…  (Enter to send)' : 'Pick a model to start chatting'}
             disabled={!loaded}
             className="flex-1 min-w-0 resize-none bg-elevated border border-border rounded-lg px-3 py-2 text-sm text-text placeholder:text-text-muted focus:outline-none focus:border-accent/50 disabled:opacity-50"
+          />
+          {/* Same picker as agent mode: browse a folder, click a model to load it. */}
+          <ModelPicker
+            align="top"
+            className="mb-1"
+            load={(path) => playgroundApi.load(path, false)}
+            onLoaded={() => { void refreshStatus() }}
           />
           {generating ? (
             <button
@@ -331,7 +256,22 @@ export function PlaygroundChat() {
         </div>
 
         <div className="flex items-center gap-3 mt-2 text-[10px] text-text-muted">
-          <label className="flex items-center gap-1.5">
+          {loaded && (
+            <span className="flex items-center gap-1.5 min-w-0">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
+              <span className="text-text truncate max-w-[220px]">{loaded.filename}</span>
+              {loaded.quantization && (
+                <span className="px-1.5 py-0.5 rounded bg-elevated border border-border flex-shrink-0">
+                  {loaded.quantization}
+                </span>
+              )}
+              {loaded.n_ctx && <span className="flex-shrink-0">ctx {loaded.n_ctx}</span>}
+              <span className="flex items-center gap-0.5 flex-shrink-0">
+                <Cpu size={9} /> {loaded.use_gpu ? 'GPU' : 'CPU'}
+              </span>
+            </span>
+          )}
+          <label className="flex items-center gap-1.5 ml-auto">
             Max tokens
             <input
               value={maxTokens}

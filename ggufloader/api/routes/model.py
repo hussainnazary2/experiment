@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from ggufloader.api.auto_load import (
     auto_load_status,
     pinned_download_status,
+    remember_model_dir,
     start_pinned_download,
 )
 from ggufloader.api.deps import get_model_backend, set_model_backend, get_router
@@ -50,8 +51,8 @@ class ModelInfo(BaseModel):
     auto_load: Optional[str] = None
     auto_load_message: Optional[str] = None
     models_dir: Optional[str] = None
-    # Pinned-target compatibility of the currently loaded model. False when
-    # a model somehow got loaded despite the gate (e.g. older session state);
+    # Is the loaded model the tuned pinned target? False means it runs with
+    # generic sampling/prompts (advisory only - loading is never blocked);
     # None when nothing is loaded.
     compatible: Optional[bool] = None
     compatible_error: Optional[str] = None
@@ -63,37 +64,32 @@ PINNED_ARCH = "gemma4"
 def pinned_target_error(profile) -> Optional[str]:
     """Return a human message if profile is NOT the pinned target, else None.
 
-    Single source of truth shared by the load gate below and the startup
-    auto-loader (api/auto_load.py). Multi-model auto-detection was removed;
-    any other GGUF is rejected loudly instead of running with mismatched
-    sampling or prompts.
+    ADVISORY ONLY. The pinned Gemma 4 12B Q4_K_M stays the recommended
+    model (best sampling/prompt tuning), but any GGUF can be loaded now:
+    this verdict feeds the ``compatible`` field in /model/info so the UI
+    can nudge the user, and it is used by the startup auto-loader to
+    prefer the pinned model when one is on disk. Nothing rejects a load.
     """
     arch = (profile.architecture or "").lower()
     quant_blob = ((profile.quantization or "") + " " + profile.filename).upper()
     param_blob = ((profile.param_count_estimate or "") + " " + profile.filename).upper()
     if arch != PINNED_ARCH:
         return (
-            f"Unsupported model: architecture '{profile.architecture}'. "
-            "This build is pinned to Gemma 4 12B Instruct (Q4_K_M) only."
+            f"Architecture '{profile.architecture}' is not the tuned target "
+            "(Gemma 4 12B Q4_K_M). It loads fine, but sampling and prompts "
+            "fall back to the generic profile."
         )
     if "Q4_K_M" not in quant_blob:
         return (
-            f"Unsupported quantization: '{profile.quantization}'. "
-            "This build is pinned to Gemma 4 12B Instruct Q4_K_M only."
+            f"Quantization '{profile.quantization}' is not the tuned target "
+            "(Q4_K_M). Quality/speed may differ from the tuned numbers."
         )
     if "12B" not in param_blob:
         return (
-            f"Unsupported size: '{profile.param_count_estimate}'. "
-            "This build is pinned to Gemma 4 12B Instruct (Q4_K_M) only."
+            f"Size '{profile.param_count_estimate}' is not the tuned target "
+            "(12B). Fine to run, just not the benchmarked configuration."
         )
     return None
-
-
-def _require_pinned_target(profile) -> None:
-    """HTTP load gate: raise 400 unless profile is the pinned target."""
-    err = pinned_target_error(profile)
-    if err:
-        raise HTTPException(status_code=400, detail=err)
 
 
 @router.get("/info")
@@ -172,6 +168,10 @@ async def load_model(req: LoadRequest) -> dict:
     Any of n_ctx / use_gpu / n_gpu_layers being null delegates that
     decision to the router's plan; explicit values override it and are
     still verified against real memory before the load ladder runs.
+
+    Any GGUF architecture is accepted (Gemma 4 12B Q4_K_M is the tuned
+    default, not a requirement). The runtime still keeps exactly one
+    Llama alive - the previous model is replaced.
     """
     if not os.path.exists(req.path):
         raise HTTPException(status_code=404, detail=f"File not found: {req.path}")
@@ -183,8 +183,10 @@ async def load_model(req: LoadRequest) -> dict:
             raise HTTPException(status_code=400, detail=f"Unknown role: {req.role}")
 
         router = get_router()
-        # Single-model gate (metadata-only inspect, cached).
-        _require_pinned_target(router.inspect(req.path))
+        # Any GGUF is allowed here: the pinned Gemma 4 12B Q4_K_M is the
+        # tuned default, not a hard requirement (hussainnazary2's build is
+        # a local-model testing ground). The runtime rule that still holds
+        # is "one Llama at a time" - router.load replaces the current one.
         backend, profile, strategy, _config = router.load(
             req.path,
             role,
@@ -193,6 +195,10 @@ async def load_model(req: LoadRequest) -> dict:
             n_gpu_layers=req.n_gpu_layers,
         )
         set_model_backend(backend)
+        # Remember where this model came from so the next startup scans
+        # that folder too (the file may live far from the default models
+        # dir - e.g. an external drive).
+        remember_model_dir(str(Path(req.path).parent))
         return {
             "status": "loaded",
             "path": req.path,

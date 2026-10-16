@@ -150,10 +150,13 @@ release/
 models/*.gguf
 models/*.bin
 
-# User data created at runtime (chat sessions, exports, local config)
+# User data created at runtime (chat sessions, exports, local config).
+# Anchored to the repo root on purpose: a bare `config/` also swallowed the
+# tracked package directory ggufloader/config/ (model_families.json never
+# made it into the repository).
 chats/
 exports/
-config/
+/config/
 
 # Local llama.cpp reference checkout + prebuilt binaries
 llama.cpp/

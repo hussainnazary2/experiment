@@ -150,6 +150,17 @@
       "evidence": "ggufloader/api/routes/playground.py + frontend/src/components/chat/PlaygroundChat.tsx; tests/unit/test_playground.py (12 passed); tsc -b, vite build and electron tsc pass"
     },
     {
+      "id": "feat-017",
+      "name": "Load any GGUF + one shared model picker + prompt-box token readouts",
+      "description": "The pinned Gemma 4 12B Q4_K_M becomes the tuned default instead of a load gate; startup auto-load falls back to the newest GGUF; chat and agent mode share one model picker (browse folder, click to load); prompt/total/session token counts sit above the prompt box; restored the gitignored model_families.json",
+      "dependencies": [
+        "feat-003",
+        "feat-015"
+      ],
+      "status": "done",
+      "evidence": "tests/unit/test_model_load_any_gguf.py (10 passed) + 3 new playground token-count tests; pytest tests/unit 624 passed / 4 pre-existing llama-cpp-python+PySide6 failures; tsc -b and vite build clean; /api/model/catalog lists the reported GGUFs"
+    },
+    {
       "id": "feat-016",
       "name": "Multi-model benchmark engine (backend only, not surfaced in the UI)",
       "description": "SuiteRunner loads several GGUFs back-to-back, measures TTFT + tokens/sec, saves and exports reports; routes at /api/benchmark/suite/*. Kept for later; no UI uses it now",

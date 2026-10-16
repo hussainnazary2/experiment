@@ -22,11 +22,12 @@ type Status = 'checking' | 'ready' | 'missing'
 /**
  * First-launch model-compatibility check.
  *
- * Shows once per install (localStorage flag) and verifies the loaded
- * model against the pinned Gemma 4 12B Q4_K_M target. While the startup
- * auto-loader is still scanning/loading it polls /api/model/info, then
- * presents either a green "ready" card or guidance on where to place the
- * GGUF. Any explicit dismissal marks the check as done.
+ * Shows once per install (localStorage flag) and reports which model the
+ * startup auto-loader found. While it is still scanning/loading it polls
+ * /api/model/info, then presents either a green "ready" card or guidance
+ * on where to place a GGUF. Any explicit dismissal marks the check done,
+ * and any loaded model counts as ready — the pinned Gemma 4 12B Q4_K_M is
+ * the tuned target, not a requirement.
  */
 export function CompatibilityDialog() {
   const [open, setOpen] = useState(false)
@@ -44,9 +45,10 @@ export function CompatibilityDialog() {
   const settle = useCallback((i: ModelInfo) => {
     if (!mounted.current) return
     setInfo(i)
-    if (i.loaded && i.compatible !== false) {
-      // Model present and compatible: nothing to check. Mark done and
-      // never surface the dialog on the happy path.
+    if (i.loaded) {
+      // Any loaded model is fine - the pinned Gemma 4 12B Q4_K_M is the
+      // tuned target, not a requirement. Mark done and never surface the
+      // dialog on the happy path.
       try { localStorage.setItem(DONE_KEY, '1') } catch { /* ignore */ }
       setStatus('ready')
       setOpen(false)
@@ -102,7 +104,7 @@ export function CompatibilityDialog() {
       let pre: ModelInfo | null = null
       try { pre = await modelApi.info() } catch { /* offline */ }
       if (!alive) return
-      if (pre && pre.loaded && pre.compatible !== false) {
+      if (pre && pre.loaded) {
         try { localStorage.setItem(DONE_KEY, '1') } catch { /* ignore */ }
         mounted.current = false
         return
@@ -161,10 +163,11 @@ export function CompatibilityDialog() {
                 <p className="text-sm font-medium text-text">Model ready</p>
                 <p className="text-xs text-text-sec leading-relaxed">
                   {info?.filename
-                    ? <><span className="font-mono text-text">{info.filename}</span> is loaded and
-                      matches the pinned target.</>
-                    : 'A compatible model is loaded.'}{' '}
-                  This build of {app.name} is {app.tagline.toLowerCase()}.
+                    ? <><span className="font-mono text-text">{info.filename}</span> is loaded
+                      {info.compatible === false
+                        ? ' — not the tuned target, so sampling and prompts come from the generic profile.'
+                        : ' and matches the tuned target.'}</>
+                    : 'A model is loaded.'}
                 </p>
               </div>
             </div>
@@ -176,8 +179,9 @@ export function CompatibilityDialog() {
               <div className="space-y-2 flex-1">
                 <p className="text-sm font-medium text-text">Model needed</p>
                 <p className="text-xs text-text-sec leading-relaxed">
-                  This build runs only on <span className="text-text">{app.label}</span> (Q4_K_M).
-                  No compatible model is loaded yet.
+                  No model is loaded yet. This build is tuned for{' '}
+                  <span className="text-text">{app.label}</span> (Q4_K_M) — pick a model
+                  from the model picker, or drop a GGUF in the folder below.
                 </p>
                 {info?.auto_load_message && (
                   <p className="text-xs text-amber-300/90 leading-relaxed">
@@ -187,8 +191,8 @@ export function CompatibilityDialog() {
                 {info?.models_dir && (
                   <div className="space-y-1">
                     <p className="text-[11px] text-text-muted">
-                      Place your Gemma 4 12B Q4_K_M <span className="font-mono">.gguf</span> here —
-                      it will be detected and loaded automatically:
+                      Place a <span className="font-mono">.gguf</span> here — any model is
+                      detected and loaded automatically at startup:
                     </p>
                     <div className="px-3 py-2 bg-elevated border border-border rounded-lg font-mono text-[11px] text-accent break-all">
                       {info.models_dir}

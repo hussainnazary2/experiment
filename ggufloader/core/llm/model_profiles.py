@@ -295,6 +295,11 @@ FAMILY_PROFILES = _load_family_profiles()
 
 # Applied when nothing matches: conservative defaults that behave well on
 # most small instruct quants (see the LFM2.5 degeneration incident).
+#
+# It carries a system prompt on purpose. PromptBuilder refuses to run the
+# agent without a router-provided prompt, so a family without one makes
+# agent mode fail outright - previously every non-gemma4 GGUF (Qwen, LFM,
+# anything else) hit that wall.
 GENERIC_PROFILE = {
     "family": "generic",
     "label": "Generic instruct",
@@ -307,16 +312,32 @@ GENERIC_PROFILE = {
     "repeat_penalty": 1.05,
     "min_p": 0.0,
     "max_tokens": 4096,
+    "system_prompt": (
+        "You are a helpful file assistant. You read files, search the "
+        "workspace, run commands, and help users understand and modify "
+        "their project.\n\n"
+        "Respond with ONLY a JSON object (no markdown):\n"
+        '{"reasoning": "what you plan to do", "estimated_steps": 3, '
+        '"tool_calls": [{"tool": "tool_name", "parameters": {}}], "answer": ""}\n\n'
+        "When answering:\n"
+        '{"reasoning": "summary", "estimated_steps": 0, "tool_calls": [], '
+        '"answer": "your answer"}\n\n'
+        "Rules: tool_calls and answer are mutually exclusive. Think step by "
+        "step, keep reasoning concise, and always finish with either the "
+        "tool call you need or the final answer. Never repeat yourself: do "
+        "not re-issue the same tool call, the same parameters, or the same "
+        "sentence. Once the task is done, stop."
+    ),
 }
 
 
 def detect_family(metadata: Dict[str, str], model_path: str | Path) -> Tuple[Dict[str, Any], str]:
     """Return ``(profile, how_detected)`` for the given model.
 
-    Single-model app: only the ``gemma4`` family exists. Gemma 4 files
-    (GGUF arch ``gemma4`` or a gemma-4/gemma4 name) resolve to the pinned
-    profile; everything else falls through to the conservative generic
-    profile and is rejected at the model load gate.
+    Gemma 4 files (GGUF arch ``gemma4`` or a gemma-4/gemma4 name) resolve
+    to the pinned, tuned profile; everything else falls through to the
+    conservative generic profile, which is loadable in its own right
+    (generic sampling + a model-agnostic agent prompt).
     """
     arch = (metadata.get("architecture") or "").lower()
     name = (

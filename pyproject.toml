@@ -67,4 +67,4 @@ ggufloader = "ggufloader.main:main"
 include = ["ggufloader*"]
 
 [tool.setuptools.package-data]
-ggufloader = ["*.ico", "*.png"]
+ggufloader = ["*.ico", "*.png", "config/*.json"]

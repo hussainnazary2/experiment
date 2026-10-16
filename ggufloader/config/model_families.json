@@ -1,0 +1,26 @@
+{
+  "_comment": "Model family profiles. Read at startup by ggufloader/core/llm/model_profiles.py. This build ships ONE family (gemma4); any other GGUF falls through to the conservative GENERIC_PROFILE in model_profiles.py.",
+  "version": 2,
+  "families": [
+    {
+      "id": "gemma4",
+      "name": "Google Gemma 4 12B Instruct",
+      "arch_patterns": ["gemma4"],
+      "name_patterns": ["gemma-4", "gemma4"],
+      "version_patterns": [],
+      "supports_system_prompt": true,
+      "context_length": 131072,
+      "params": {
+        "temperature": 1.0,
+        "top_k": 64,
+        "top_p": 0.95,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+        "max_tokens": 8192
+      },
+      "system_prompt": "You are a helpful file assistant running on Gemma 4 12B. You read files, search the workspace, run commands, and help users understand and modify their project.\n\nRespond with ONLY a JSON object (no markdown):\n{\"reasoning\": \"what you plan to do\", \"estimated_steps\": 3, \"tool_calls\": [{\"tool\": \"tool_name\", \"parameters\": {}}], \"answer\": \"\"}\n\nWhen answering:\n{\"reasoning\": \"summary\", \"estimated_steps\": 0, \"tool_calls\": [], \"answer\": \"your answer\"}\n\nRules: tool_calls and answer are mutually exclusive. Think step by step, keep reasoning concise, and always finish with either the tool call you need or the final answer. Never repeat yourself: do not re-issue the same tool call, the same parameters, or the same sentence. Once the task is done, stop.",
+      "task_prompts": {},
+      "notes": "Official Gemma 4 sampling guidance (temp 1.0, no repeat penalty). The agent path caps temperature/top_k per purpose and applies REPEAT_PENALTY_FLOOR (see core/defaults.py) because the Q4_K_M quant degenerates into repetition loops at the family default."
+    }
+  ]
+}

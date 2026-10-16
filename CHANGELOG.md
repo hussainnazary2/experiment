@@ -27,6 +27,35 @@ prefer.
 
 ### Changed
 - The center column defaults to the chatbot; the agent view is behind a toggle.
+- **One model picker for both views** (`frontend/src/components/model/ModelPicker.tsx`):
+  the chatbot now selects models exactly like agent mode - browse a folder of
+  GGUFs, see family / quantization / size, click one to load it. The picker
+  lives in the prompt row in both views, and defaults to the app's models
+  folder when none has been chosen yet.
+- **Token readouts sit directly above the prompt box** in the chatbot and
+  gained the counts that were missing: **prompt tokens**, **total tokens**
+  (prompt + generated) and the running **session total**.
+
+### Fixed
+- **Any GGUF loads again.** `POST /api/model/load` no longer rejects every
+  model that is not the pinned Gemma 4 12B Q4_K_M with HTTP 400. The pinned
+  model is the tuned default (reported as `compatible` in `/api/model/info`),
+  not a gate. The frontend also stopped swallowing load failures, so a
+  rejected load now shows the reason instead of looking like nothing happened.
+- **Startup auto-load falls back to the newest GGUF of any architecture** when
+  no pinned model is on disk, so the app still opens with a working model.
+- **`ggufloader/config/model_families.json` is in the repo again.** The
+  unanchored `config/` ignore rule excluded that tracked package directory, so
+  the documented single source of family params + system prompt was missing
+  from every clone (and `test_gemma4_degeneration` failed). The rule is now
+  `/config/` and the file ships via package-data.
+- Non-gemma4 families get a model-agnostic agent system prompt, so agent mode
+  no longer raises "No system prompt provided by the model router" for Qwen,
+  LFM and other GGUFs.
+- The model catalog reports `quantization` and `context_length` again -
+  `quick_profile` omitted both, so the model lists showed a blank quant column.
+- `tsc -b` succeeds: `frontend/src/api/client.ts` now exports the `testingApi`
+  that `TestingStudioPanel` imports.
 
 ### Removed
 - In-app screen recording: the `useScreenRecorder` hook, the recording HUD and

@@ -6,7 +6,7 @@ message, and stream the reply back token by token together with live speed
 stats so a viewer can watch:
 
 * the tokens as they stream,
-* how many tokens have been generated,
+* how many tokens have been generated and the running prompt/total counts,
 * tokens/sec (decode speed) and time-to-first-token.
 
 Endpoints
@@ -65,15 +65,19 @@ def _sse(event: str, data: dict) -> str:
 
 
 def _stats(backend: Any, parts: List[str], t0: float, first: Optional[float],
-           last: Optional[float]) -> dict:
+           last: Optional[float], prompt_tokens: int = 0) -> dict:
     """Compute the live speed readout for the text generated so far.
 
     ``tokens_per_second`` is the *decode* rate (tokens divided by the time
     since the first token), which is what people mean by "speed" for a local
     model. ``total_tokens_per_second`` includes the prompt/prefill time.
+
+    Token counts: ``prompt_tokens`` is what went in (system + history +
+    message, counted with the model's own tokenizer), ``tokens_generated``
+    is what came out so far, and ``total_tokens`` is their sum.
     """
     text = "".join(parts)
-    tokens = _count_tokens(backend, text)
+    generated = _count_tokens(backend, text)
     now = time.perf_counter()
     elapsed_ms = (now - t0) * 1000.0
     if first is not None:
@@ -82,16 +86,31 @@ def _stats(backend: Any, parts: List[str], t0: float, first: Optional[float],
     else:
         ttft_ms = elapsed_ms
         decode_ms = 0.0
-    tps = (tokens / (decode_ms / 1000.0)) if decode_ms > 0 else 0.0
-    total_tps = (tokens / (elapsed_ms / 1000.0)) if elapsed_ms > 0 else 0.0
+    tps = (generated / (decode_ms / 1000.0)) if decode_ms > 0 else 0.0
+    total_tps = (generated / (elapsed_ms / 1000.0)) if elapsed_ms > 0 else 0.0
     return {
-        "tokens_generated": tokens,
+        "prompt_tokens": prompt_tokens,
+        "tokens_generated": generated,
+        "total_tokens": prompt_tokens + generated,
         "elapsed_ms": round(elapsed_ms, 1),
         "ttft_ms": round(ttft_ms, 1),
         "decode_ms": round(decode_ms, 1),
         "tokens_per_second": round(tps, 2),
         "total_tokens_per_second": round(total_tps, 2),
     }
+
+
+def _count_prompt_tokens(backend: Any, messages: List[dict]) -> int:
+    """Token count of the prompt parts, using the model's own tokenizer.
+
+    Counted from the message contents (plus a small per-message allowance
+    for role/turn markers the chat template adds) - close enough for a
+    live prompt/total readout without rendering the template twice.
+    """
+    blob = "\n".join(str(m.get("content") or "") for m in messages)
+    if not blob:
+        return 0
+    return _count_tokens(backend, blob) + 4 * len(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +231,7 @@ async def chat_stream(req: ChatStreamRequest):
     messages = _build_messages(req)
     temperature = req.temperature
     max_tokens = req.max_tokens
+    prompt_tokens = _count_prompt_tokens(backend, messages)
 
     def event_stream() -> Iterator[str]:
         parts: List[str] = []
@@ -231,9 +251,10 @@ async def chat_stream(req: ChatStreamRequest):
                 yield _sse("token", {"token": piece})
                 if now - last_emit >= _STATS_INTERVAL_S:
                     last_emit = now
-                    yield _sse("stats", _stats(backend, parts, t0, first, last))
+                    yield _sse("stats", _stats(
+                        backend, parts, t0, first, last, prompt_tokens))
 
-            done = _stats(backend, parts, t0, first, last)
+            done = _stats(backend, parts, t0, first, last, prompt_tokens)
             done["content"] = "".join(parts)
             yield _sse("done", done)
         except Exception as e:  # noqa: BLE001 - report into the stream
@@ -258,13 +279,14 @@ async def chat(req: ChatStreamRequest) -> dict:
     if backend is None:
         raise HTTPException(status_code=400, detail="No model loaded")
 
+    messages = _build_messages(req)
     parts: List[str] = []
     t0 = time.perf_counter()
     first: Optional[float] = None
     last: Optional[float] = None
     try:
         for piece in backend.chat_stream(
-            messages=_build_messages(req), temperature=req.temperature, max_tokens=req.max_tokens
+            messages=messages, temperature=req.temperature, max_tokens=req.max_tokens
         ):
             now = time.perf_counter()
             if first is None:
@@ -275,6 +297,6 @@ async def chat(req: ChatStreamRequest) -> dict:
         logger.error("Playground chat failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    out = _stats(backend, parts, t0, first, last)
+    out = _stats(backend, parts, t0, first, last, _count_prompt_tokens(backend, messages))
     out["content"] = "".join(parts)
     return out

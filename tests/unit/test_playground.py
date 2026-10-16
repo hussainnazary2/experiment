@@ -97,6 +97,17 @@ class TestStats:
         assert stats["decode_ms"] == 0.0
         assert stats["tokens_per_second"] == 0.0
 
+    def test_prompt_and_total_token_counts(self):
+        """The readouts above the prompt box need in + out = total."""
+        backend = FakeBackend(tokens=7)
+        base = time.perf_counter()
+        stats = playground._stats(
+            backend, ["some generated text"], base - 1.0, base - 0.5, base - 0.1,
+            prompt_tokens=11)
+        assert stats["prompt_tokens"] == 11
+        assert stats["tokens_generated"] == 7
+        assert stats["total_tokens"] == 18
+
 
 # ── Streaming chat ───────────────────────────────────────────────────────
 
@@ -175,6 +186,41 @@ class TestChatStream:
         body = r.json()
         assert body["content"] == "all at once"
         assert body["tokens_generated"] == 3
+
+    def test_stream_reports_prompt_and_total_tokens(self, client, monkeypatch):
+        """Every stats/done frame carries the prompt + total counts the UI
+        renders above the prompt box."""
+        backend = FakeBackend(pieces=("hey"), tokens=4)
+        monkeypatch.setattr(playground, "get_model_backend", lambda: backend)
+        monkeypatch.setattr(playground, "_STATS_INTERVAL_S", 0.0)
+
+        r = client.post("/api/playground/chat/stream", json={"message": "hi"})
+        events = parse_sse(r.text)
+        frames = [d for e, d in events if e in ("stats", "done")]
+        assert frames, "expected stats/done frames"
+        for f in frames:
+            assert f["prompt_tokens"] > 0
+            assert f["tokens_generated"] == 4
+            assert f["total_tokens"] == f["prompt_tokens"] + 4
+
+    def test_prompt_tokens_count_system_and_history(self, client, monkeypatch):
+        backend = FakeBackend(tokens=4)
+        monkeypatch.setattr(playground, "get_model_backend", lambda: backend)
+        honest = client.post(
+            "/api/playground/chat/stream",
+            json={"message": "hi"},
+        )
+        long = client.post(
+            "/api/playground/chat/stream",
+            json={
+                "message": "hi",
+                "system_prompt": "be brief",
+                "history": [{"role": "user", "content": "first"}],
+            },
+        )
+        short_prompt = [d for e, d in parse_sse(honest.text) if e == "done"][0]["prompt_tokens"]
+        long_prompt = [d for e, d in parse_sse(long.text) if e == "done"][0]["prompt_tokens"]
+        assert long_prompt > short_prompt
 
 
 # ── Model status / routes ────────────────────────────────────────────────

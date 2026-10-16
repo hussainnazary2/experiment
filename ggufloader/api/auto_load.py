@@ -1,14 +1,16 @@
-"""Startup auto-load of the pinned Gemma 4 12B Q4_K_M GGUF.
+"""Startup auto-load of a local GGUF.
 
-Single-model app contract: the model should be ready when the UI opens,
-with no manual "Load Model" step. This module:
+The app is tuned for Gemma 4 12B Q4_K_M, so that is what this module
+prefers - but it is no longer the only thing that can load. When no
+pinned GGUF is on disk the newest GGUF of *any* architecture is loaded,
+so the UI still opens with a working model instead of an empty chat.
 
 1. Remembers the directory a model was last loaded from (config dir JSON),
    so an existing GGUF keeps working across app restarts without moving it.
 2. Scans that directory plus the default models folder for a GGUF that
-   passes the pinned-target gate.
-3. Loads the best candidate in a background thread (server stays
-   responsive while an 8 GB model loads) and publishes state that the
+   passes the pinned-target gate, falling back to the newest GGUF present.
+3. Loads the candidate in a background thread (server stays responsive
+   while an 8 GB model loads) and publishes state that the
    ``/api/model/info`` endpoint surfaces to the UI.
 
 Auto-load never blocks or crashes startup: failures become a status the
@@ -122,30 +124,27 @@ def _candidate_dirs() -> List[str]:
 
 
 def _is_pinned(profile) -> Optional[str]:
-    """Return an error message if ``profile`` is not the pinned target.
+    """Return an error message if ``profile`` is not the tuned target.
 
-    Mirrors the HTTP load gate in ``api/routes/model.py`` (single source
-    of truth for what this build will run).
+    Delegates to the HTTP-route verdict (``api/routes/model.py``) so the
+    two can never drift; imported lazily because that module imports this
+    one at module level.
     """
-    arch = (profile.architecture or "").lower()
-    quant_blob = ((profile.quantization or "") + " " + profile.filename).upper()
-    param_blob = ((profile.param_count_estimate or "") + " " + profile.filename).upper()
-    if arch != "gemma4":
-        return f"architecture '{profile.architecture}'"
-    if "Q4_K_M" not in quant_blob:
-        return f"quantization '{profile.quantization}'"
-    if "12B" not in param_blob:
-        return f"size '{profile.param_count_estimate}'"
-    return None
+    from ggufloader.api.routes.model import pinned_target_error
+    return pinned_target_error(profile)
 
 
-def _find_pinned_file(dirs: List[str]):
-    """Scan directories for the newest GGUF passing the pinned gate.
+def _find_model_file(dirs: List[str]):
+    """Scan directories for the GGUF to auto-load.
 
-    Returns (path, profile) or (None, None). Inspect is metadata-only
-    (cached by the router), so this is fast even for large files.
+    Prefers the newest GGUF passing the pinned-target gate (Gemma 4 12B
+    Q4_K_M); when none exists, falls back to the newest GGUF of any
+    architecture rather than leaving the app modelless. Returns
+    (path, profile) or (None, None). Inspect is metadata-only (cached by
+    the router), so this is fast even for large files.
     """
     router = get_router()
+    pinned = None
     newest = None
     for d in dirs:
         root = Path(d)
@@ -158,11 +157,14 @@ def _find_pinned_file(dirs: List[str]):
             except Exception as e:
                 logger.debug("Skipping unreadable GGUF %s: %s", p, e)
                 continue
-            reason = _is_pinned(profile)
-            if reason is None:
-                if newest is None or p.stat().st_mtime > newest[0].stat().st_mtime:
-                    newest = (p, profile)
-    return (newest[0], newest[1]) if newest else (None, None)
+            mtime = p.stat().st_mtime
+            if newest is None or mtime > newest[2]:
+                newest = (p, profile, mtime)
+            if _is_pinned(profile) is None:
+                if pinned is None or mtime > pinned[2]:
+                    pinned = (p, profile, mtime)
+    best = pinned or newest
+    return (best[0], best[1]) if best else (None, None)
 
 
 def _in_test_env() -> bool:
@@ -178,13 +180,14 @@ def _worker_run() -> None:
     try:
         dirs = _candidate_dirs()
         logger.info("Auto-load scan: %s", dirs)
-        path, _profile = _find_pinned_file(dirs)
+        path, _profile = _find_model_file(dirs)
         if path is None:
             with _lock:
                 _state.update({
                     "status": "not_found",
-                    "message": "No Gemma 4 12B Q4_K_M GGUF found in models folder(s): "
-                               + ", ".join(dirs or ["<none>"]) + ".",
+                    "message": "No GGUF model found in models folder(s): "
+                               + ", ".join(dirs or ["<none>"])
+                               + ". Gemma 4 12B Q4_K_M is the tuned target.",
                     "path": None,
                 })
             return
@@ -207,7 +210,7 @@ def _worker_run() -> None:
                 "message": None,
                 "path": str(path),
             })
-        logger.info("Auto-loaded pinned model: %s", path)
+        logger.info("Auto-loaded model: %s", path)
     except Exception as e:  # noqa: BLE001 - surface instead of crashing
         logger.exception("Auto-load failed")
         with _lock:

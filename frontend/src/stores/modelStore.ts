@@ -53,7 +53,11 @@ export const useModelStore = create<ModelState>((set) => ({
       const info = await modelApi.info()
       set({ info, loading: false })
     } catch (e: any) {
+      // Record AND rethrow: callers (the model picker) need the reason to
+      // show it - swallowing it here made a rejected load look like a
+      // click that did nothing.
       set({ error: e.message, loading: false })
+      throw e
     }
   },
 

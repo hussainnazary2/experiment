@@ -1,5 +1,41 @@
 # Session Progress Log
 
+## Session: 2026-10-16 - Load any GGUF + one model picker + token readouts
+
+**Goal:** make the app usable with the models people actually test with.
+
+- `ggufloader/api/routes/model.py` - `POST /model/load` no longer hard-rejects
+  non-pinned GGUFs (the pinned-target verdict is advisory only, still surfaced
+  as `compatible`/`compatible_error`). The successful load remembers its folder
+  so the next startup scans it too.
+- `ggufloader/api/auto_load.py` - `_find_model_file` prefers the pinned target
+  and otherwise falls back to the newest GGUF of any architecture.
+- `ggufloader/config/model_families.json` - restored. `.gitignore`'s
+  unanchored `config/` rule had excluded the tracked package directory, so the
+  file was missing from every clone; the rule is now `/config/` and the file is
+  listed in `pyproject.toml` package-data. Non-gemma4 families also got a
+  generic agent system prompt (agent mode used to raise without one).
+- `ggufloader/core/router.py` - `quick_profile` reports quantization + context
+  length, which the catalog/pickers were silently dropping.
+- `frontend/src/components/model/ModelPicker.tsx` - one shared picker (folder
+  browse, rich list, click-to-load, pinned-download fallback, visible errors)
+  used by agent mode (`MessageInput`) and the chatbot (`PlaygroundChat`).
+- `ggufloader/api/routes/playground.py` - `stats`/`done` now carry
+  `prompt_tokens` and `total_tokens`; the chatbot renders tokens/sec, generated,
+  prompt, total, session, first-token and elapsed directly above the prompt box.
+- `frontend/src/api/client.ts` - added the missing `testingApi` export
+  (`tsc -b` failed for the whole app without it).
+
+**Verified:** `pytest tests/unit` - 624 passed, 4 failed (the pre-existing
+`llama-cpp-python`/PySide6 environment failures), 5 skipped, including the new
+`tests/unit/test_model_load_any_gguf.py` (10) and 3 new playground token-count
+tests. `tsc -b` and `vite build` clean. Live: app boots, `/api/model/catalog`
+lists all five reported filenames with quant, `/api/model/load` accepts them via
+the HTTP route (regression test), and the Vite preview serves the UI.
+
+**Not verified here:** a real end-to-end load of multi-GB weights (no
+`llama-cpp-python` in this environment) - needs a machine with llama.cpp.
+
 ## Session: 2026-10-16 - Local model speed chatbot
 
 **Goal (after direction change):** a plain chatbot that shows everything a
