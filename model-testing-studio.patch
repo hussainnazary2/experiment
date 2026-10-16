@@ -1,0 +1,2449 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4082b26..0bd6cce 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,36 @@
+ # Changelog
+ 
++## [2.4.0] - 2026-10-16
++
++### Model Testing Studio
++
++A new **Testing** panel turns the app into a benchmarking platform: run
++several GGUF models back-to-back on CPU, watch their real speed, and record
++the screen to share.
++
++### Added
++- **Model Testing Studio** (`ggufloader/core/testing/`) - loads each selected
++  GGUF in turn, runs a fixed prompt workload through it, measures real
++  time-to-first-token and decode tokens/sec from llama.cpp's own stream,
++  unloads it, then moves to the next model.
++- **Live leaderboard** - the Testing panel ranks models by tokens/sec as they
++  finish, with TTFT, load time, and per-prompt detail.
++- **Screen recording** - capture the app window to a `.webm` with the browser's
++  MediaRecorder, with a live stats HUD rendered inside the window so the speed
++  is visible in the video; packaged Electron builds save straight to disk
++  through a new `save-recording` IPC bridge.
++- **Shareable reports** - export any run as JSON, Markdown, or CSV.
++- **REST routes** under `/api/benchmark/suite/*`, plus `/api/benchmark/run`
++  (the frontend client already called this endpoint, but the backend never
++  implemented it).
++
++### Notes
++- Benchmarks run on **CPU by default**; a GPU toggle is available.
++- The pinned chat model is left untouched: the studio frees the global backend
++  before a run and re-triggers the startup auto-loader afterwards, so the
++  "at most one Llama" invariant holds.
++- Sample choice and docs: `docs/superpowers/specs/2026-10-16-model-testing-studio-design.md`.
++
+ ## [2.3.0] - 2026-09-04
+ 
+ ### The single-model agent build
+diff --git a/docs/superpowers/specs/2026-10-16-model-testing-studio-design.md b/docs/superpowers/specs/2026-10-16-model-testing-studio-design.md
+new file mode 100644
+index 0000000..a9ec4f3
+--- /dev/null
++++ b/docs/superpowers/specs/2026-10-16-model-testing-studio-design.md
+@@ -0,0 +1,111 @@
++# Model Testing Studio — design
++
++**Date:** 2026-10-16
++**Status:** implemented
++
++## Goal
++
++Turn GGUF Loader into a testing platform that runs **several GGUF models
++back-to-back on CPU**, measures their real speed (time-to-first-token and
++decode tokens/sec), shows a live leaderboard, and lets the user **record the
++screen** so the speed differences can be shown to other people.
++
++## Why this needs new code
++
++- The app is deliberately pinned to one model. `api/routes/model.py`'s
++  `_require_pinned_target` gate rejects every other GGUF, so "run different
++  models" is blocked at the HTTP layer.
++- `core/agent/benchmark.py` already has a `ModelBenchmark` engine that
++  measures tok/s + TTFT from a plain callable, and the UI can list past
++  reports — but there is **no way to actually start a run** from the UI, and
++  it measures a single already-loaded model (it never swaps models).
++- The frontend `benchmarkApi.run` client call targets `/api/benchmark/run`,
++  which does not exist on the backend.
++
++## Architecture
++
++```
++frontend/src/components/agent/TestingStudioPanel.tsx
++  |  REST (poll)                        getDisplayMedia + MediaRecorder
++  v                                              v
++/api/benchmark/suite/*  ---------------->  .webm recording (browser); saved to
++  |                                          disk via Electron IPC when packaged
++  v
++ggufloader/core/testing/runner.py  (SuiteRunner)
++  |  load_fn / unload_fn  (injected; default = core/router.py + ModelBackend)
++  v
++one llama.cpp model at a time (CPU by default)
++```
++
++### Key decisions
++
++1. **Separate benchmark path, pinned chat model untouched.** The suite runner
++   never calls the pinned-target gate. The API layer frees the app's global
++   backend before a run and re-triggers the startup auto-loader afterwards, so
++   the "at most one `Llama`" invariant holds.
++2. **Real metrics, measured from the stream.** TTFT = wall time from request
++   to the first streamed piece; tokens/sec = tokenizer token count of the
++   generated text divided by decode wall time (`first piece -> last piece`).
++   Sampling is greedy (temperature 0, top_k 1) so runs are comparable.
++3. **Fixed workload.** A small, fixed prompt set (`SUITE_PROMPTS`) with a
++   per-prompt `max_tokens` cap, so every model does the same work.
++4. **Injected I/O for testability.** `SuiteRunner` takes `load_fn` /
++   `unload_fn` / `clock`, so the whole engine is headless-testable with a
++   fake backend (no model, no GPU). This matches the repo's "tests are
++   headless" convention.
++5. **Polling, not WebSocket.** Benchmark state is polled (~700 ms) from
++   `/api/benchmark/suite/status`. It is simpler and does not touch the
++   WebSocket event contract.
++6. **Recording = capture the window.** `getDisplayMedia` + `MediaRecorder`
++   record the app window to `.webm`. A recording HUD overlay shows the live
++   tok/s while recording, so the video itself displays the speed.
++
++## Backend surface
++
++`ggufloader/core/testing/runner.py`
++
++- `SuitePrompt`, `PromptResult`, `ModelResult`, `SuiteRun` dataclasses
++- `SUITE_PROMPTS` — the fixed workload
++- `SuiteRunner.run(paths, device, prompt_ids, max_tokens, n_ctx, on_event)`
++- `SuiteRunner.cancel()`
++- `SuiteStore` — save / get / list runs as JSON
++- `export_markdown(run)` / `export_csv(run)`
++
++`ggufloader/api/routes/benchmark.py` (added to the existing router)
++
++| Method | Path | Purpose |
++|---|---|---|
++| GET | `/api/benchmark/suite/prompts` | the fixed workload |
++| GET | `/api/benchmark/suite/models` | candidate GGUFs (reuses the model catalog) |
++| POST | `/api/benchmark/suite/run` | start a run (background thread) |
++| GET | `/api/benchmark/suite/status` | live progress + partial results |
++| POST | `/api/benchmark/suite/cancel` | cooperative cancel |
++| GET | `/api/benchmark/suite/runs` | saved runs |
++| GET | `/api/benchmark/suite/runs/{id}` | one run |
++| GET | `/api/benchmark/suite/runs/{id}/export` | `json` \| `markdown` \| `csv` |
++| POST | `/api/benchmark/run` | single-model convenience run (starts a 1-model suite) |
++
++## Frontend surface
++
++- `frontend/src/hooks/useScreenRecorder.ts` — `getDisplayMedia` capture to a
++  downloadable `.webm` (with an Electron save-to-disk path).
++- `frontend/src/components/agent/TestingStudioPanel.tsx` — model picker, run
++  controls, live progress, leaderboard bars, recording controls, export.
++- Registered as a sidebar plugin (`id: 'testing'`) and wired in `RightPanel`.
++- `electron/main.ts` + `preload.ts` — `save-recording` IPC so packaged builds
++  can write the video straight to disk.
++
++## Testing
++
++- `tests/unit/test_testing_studio.py` — headless: measurement math, ordering,
++  error isolation, cancellation, store round-trip, exports, route presence.
++- `python -m pytest tests/unit` — full suite stays green.
++- `cd frontend && npx tsc --noEmit && npm run build`.
++
++## Out of scope
++
++- GPU benchmarking parity (device flag exists; default is CPU as requested).
++- Real-time video compositing of charts into the recording (the HUD overlay is
++  what gets captured).
++- Downloading models from the studio (the model chip already does that; the
++  studio only lists GGUFs already on disk).
+diff --git a/electron/main.ts b/electron/main.ts
+index d38312d..ba19288 100644
+--- a/electron/main.ts
++++ b/electron/main.ts
+@@ -1,5 +1,6 @@
+ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
+ import * as path from 'path'
++import * as fs from 'fs'
+ import { spawn, execSync, ChildProcess } from 'child_process'
+ import * as net from 'net'
+ import * as http from 'http'
+@@ -386,3 +387,16 @@ ipcMain.handle('restart-backend', async () => {
+   await startBackend()
+   return true
+ })
++
++// Save a screen recording produced by the Model Testing Studio to disk.
++// The renderer sends the WebM bytes; the user picks the destination.
++ipcMain.handle('save-recording', async (_event, payload: { filename: string; data: ArrayBuffer }) => {
++  const result = await dialog.showSaveDialog(mainWindow!, {
++    title: 'Save screen recording',
++    defaultPath: payload?.filename || 'gguf-speed-test.webm',
++    filters: [{ name: 'WebM Video', extensions: ['webm'] }],
++  })
++  if (result.canceled || !result.filePath) return null
++  await fs.promises.writeFile(result.filePath, Buffer.from(payload.data))
++  return result.filePath
++})
+diff --git a/electron/preload.ts b/electron/preload.ts
+index 08f08ab..dcdfff6 100644
+--- a/electron/preload.ts
++++ b/electron/preload.ts
+@@ -13,6 +13,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
+   // Backend control
+   restartBackend: () => ipcRenderer.invoke('restart-backend'),
+ 
++  // Screen recordings from the Model Testing Studio
++  saveRecording: (filename: string, data: ArrayBuffer) =>
++    ipcRenderer.invoke('save-recording', { filename, data }),
++
+   // Platform info
+   platform: process.platform,
+   isElectron: true,
+diff --git a/feature_list.json b/feature_list.json
+index db93f86..ab7fcfe 100644
+--- a/feature_list.json
++++ b/feature_list.json
+@@ -138,6 +138,16 @@
+       ],
+       "status": "not-started",
+       "evidence": ""
++    },
++    {
++      "id": "feat-015",
++      "name": "Model Testing Studio (multi-model CPU speed benchmarks + screen recording)",
++      "description": "Run several GGUF models back-to-back on CPU, measure real time-to-first-token and tokens/sec, show a live leaderboard, record the app window to WebM, and export JSON/Markdown/CSV reports",
++      "dependencies": [
++        "feat-003"
++      ],
++      "status": "done",
++      "evidence": "ggufloader/core/testing/runner.py + /api/benchmark/suite/* routes + TestingStudioPanel; tests/unit/test_testing_studio.py (20 passed); tsc -b and vite build pass"
+     }
+   ]
+ }
+diff --git a/frontend/src/api/client.ts b/frontend/src/api/client.ts
+index 9258fa6..3eb5edb 100644
+--- a/frontend/src/api/client.ts
++++ b/frontend/src/api/client.ts
+@@ -303,10 +303,31 @@ export const benchmarkApi = {
+     }),
+   run: (modelName: string, modelPath: string) =>
+     request<any>('/benchmark/run', {
+-      method: 'POST', body: JSON.stringify({ model_name: modelName, model_path: modelPath }),
++      method: 'POST', body: JSON.stringify({ model_name: modelName, paths: [modelPath], device: 'cpu' }),
+     }),
+ }
+ 
++// Model Testing Studio API (multi-model CPU speed tests + recording)
++export const testingApi = {
++  /** The fixed prompt workload every model runs. */
++  prompts: () => request<any[]>('/benchmark/suite/prompts'),
++  /** Candidate GGUF models found on disk. */
++  models: (directory?: string) =>
++    request<any>(`/benchmark/suite/models${directory ? `?directory=${encodeURIComponent(directory)}` : ''}`),
++  /** Start a test run over the selected models. */
++  run: (opts: { paths: string[]; device?: 'cpu' | 'gpu'; prompt_ids?: string[]; max_tokens?: number | null; n_ctx?: number | null }) =>
++    request<any>('/benchmark/suite/run', { method: 'POST', body: JSON.stringify(opts) }),
++  /** Live status of the current (or last) run. */
++  status: () => request<any>('/benchmark/suite/status'),
++  cancel: () => request<any>('/benchmark/suite/cancel', { method: 'POST' }),
++  /** Saved runs, newest first. */
++  runs: (limit = 20) => request<any[]>(`/benchmark/suite/runs?limit=${limit}`),
++  runDetail: (id: string) => request<any>(`/benchmark/suite/runs/${id}`),
++  /** Direct URL for exporting a saved run. */
++  exportUrl: (id: string, format: 'json' | 'markdown' | 'csv' = 'json') =>
++    `/api/benchmark/suite/runs/${encodeURIComponent(id)}/export?format=${format}`,
++}
++
+ // Workspace API
+ export const workspaceApi = {
+   list: () => request<any[]>('/workspaces'),
+diff --git a/frontend/src/components/agent/TestingStudioPanel.tsx b/frontend/src/components/agent/TestingStudioPanel.tsx
+new file mode 100644
+index 0000000..8c97fc8
+--- /dev/null
++++ b/frontend/src/components/agent/TestingStudioPanel.tsx
+@@ -0,0 +1,576 @@
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
++import { testingApi } from '../../api/client'
++import { useScreenRecorder } from '../../hooks/useScreenRecorder'
++import {
++  Zap, Play, Square, RefreshCw, Video, Download, Trophy, Clock,
++  Cpu, Monitor, Save, Check, Circle, ImageDown,
++} from 'lucide-react'
++
++// ── Types ────────────────────────────────────────────────────────────────
++
++interface SuitePrompt {
++  id: string
++  label: string
++  prompt: string
++  max_tokens: number
++}
++
++interface PromptResult {
++  prompt_id: string
++  label: string
++  tokens_generated: number
++  ttft_ms: number
++  gen_time_ms: number
++  tokens_per_second: number
++  error: string | null
++}
++
++interface ModelResult {
++  path: string
++  name: string
++  status: string
++  error: string | null
++  size_gb: number
++  architecture: string
++  quantization: string
++  parameters: string
++  n_ctx: number | null
++  device: string
++  load_ms: number
++  prompts: PromptResult[]
++  prompt_count: number
++  avg_tps: number
++  avg_ttft_ms: number
++  total_tokens: number
++  gen_time_ms: number
++}
++
++interface SuiteStatus {
++  running: boolean
++  run_id?: string
++  device?: string
++  status?: string
++  duration_ms?: number
++  error?: string | null
++  current_model?: string
++  current_prompt?: string
++  progress?: number
++  models?: ModelResult[]
++}
++
++interface CandidateModel {
++  path: string
++  filename: string
++  size_gb: number
++  size_human: string
++  architecture: string
++  quantization: string
++  family: string
++}
++
++interface PastRun {
++  run_id: string
++  status: string
++  device: string
++  started_at: number
++  duration_ms: number
++  model_count: number
++  best_tps: number
++}
++
++const BAR_COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#a78bfa', '#f87171', '#22d3ee', '#fb923c']
++
++function downloadUrl(url: string, filename: string) {
++  const a = document.createElement('a')
++  a.href = url
++  a.download = filename
++  document.body.appendChild(a)
++  a.click()
++  a.remove()
++}
++
++function statusColor(status: string) {
++  if (status === 'ok') return 'text-emerald-400'
++  if (status === 'error') return 'text-red-400'
++  if (status === 'cancelled') return 'text-amber-400'
++  if (status === 'loading' || status === 'running') return 'text-accent'
++  return 'text-text-muted'
++}
++
++// ── Component ────────────────────────────────────────────────────────────
++
++export function TestingStudioPanel() {
++  const [prompts, setPrompts] = useState<SuitePrompt[]>([])
++  const [candidates, setCandidates] = useState<CandidateModel[]>([])
++  const [selected, setSelected] = useState<string[]>([])
++  const [promptIds, setPromptIds] = useState<string[]>([])
++  const [device, setDevice] = useState<'cpu' | 'gpu'>('cpu')
++  const [maxTokens, setMaxTokens] = useState('')
++  const [status, setStatus] = useState<SuiteStatus | null>(null)
++  const [pastRuns, setPastRuns] = useState<PastRun[]>([])
++  const [busy, setBusy] = useState(false)
++  const [loadingModels, setLoadingModels] = useState(true)
++  const [notice, setNotice] = useState<string | null>(null)
++  const [showHud, setShowHud] = useState(true)
++  const recorder = useScreenRecorder()
++  const pollRef = useRef<number | null>(null)
++
++  // ── Data loading ───────────────────────────────────────────────────────
++
++  const loadPrompts = useCallback(async () => {
++    try {
++      const p = await testingApi.prompts()
++      setPrompts(p)
++      setPromptIds(p.map((x: SuitePrompt) => x.id))
++    } catch { /* ok */ }
++  }, [])
++
++  const loadModels = useCallback(async () => {
++    setLoadingModels(true)
++    try {
++      const data = await testingApi.models()
++      setCandidates(data.models || [])
++    } catch { /* ok */ }
++    setLoadingModels(false)
++  }, [])
++
++  const loadPastRuns = useCallback(async () => {
++    try {
++      setPastRuns(await testingApi.runs())
++    } catch { /* ok */ }
++  }, [])
++
++  const refreshStatus = useCallback(async () => {
++    try {
++      const s = await testingApi.status()
++      setStatus(s)
++      return s as SuiteStatus
++    } catch {
++      return null
++    }
++  }, [])
++
++  useEffect(() => {
++    void loadPrompts()
++    void loadModels()
++    void loadPastRuns()
++    void refreshStatus()
++  }, [loadPrompts, loadModels, loadPastRuns, refreshStatus])
++
++  // Poll while a run is live.
++  useEffect(() => {
++    if (!status?.running) {
++      if (pollRef.current !== null) {
++        window.clearInterval(pollRef.current)
++        pollRef.current = null
++      }
++      return
++    }
++    if (pollRef.current === null) {
++      pollRef.current = window.setInterval(() => { void refreshStatus() }, 700)
++    }
++    return () => {
++      if (pollRef.current !== null) {
++        window.clearInterval(pollRef.current)
++        pollRef.current = null
++      }
++    }
++  }, [status?.running, refreshStatus])
++
++  // ── Actions ────────────────────────────────────────────────────────────
++
++  const toggleModel = (path: string) => {
++    setSelected((prev) => (prev.includes(path) ? prev.filter((p) => p !== path) : [...prev, path]))
++  }
++
++  const startRun = async () => {
++    if (selected.length === 0) {
++      setNotice('Select at least one model first.')
++      return
++    }
++    setBusy(true)
++    setNotice(null)
++    try {
++      const mt = maxTokens.trim() ? Number(maxTokens) : null
++      await testingApi.run({
++        paths: selected,
++        device,
++        prompt_ids: promptIds,
++        max_tokens: mt && mt > 0 ? mt : null,
++        n_ctx: null,
++      })
++      await refreshStatus()
++    } catch (e) {
++      setNotice(e instanceof Error ? e.message : 'Could not start the test run.')
++    }
++    setBusy(false)
++  }
++
++  const stopRun = async () => {
++    try {
++      await testingApi.cancel()
++    } catch { /* ok */ }
++  }
++
++  const models = useMemo(() => status?.models ?? [], [status])
++  const ranked = useMemo(
++    () => models.filter((m) => m.prompts && m.prompts.length > 0).sort((a, b) => b.avg_tps - a.avg_tps),
++    [models],
++  )
++  const maxTps = useMemo(() => Math.max(1, ...ranked.map((m) => m.avg_tps)), [ranked])
++  const fastest = ranked[0]
++  const finished = !!status && !status.running && (status.status === 'done' || status.status === 'cancelled')
++
++  const progressPct = Math.round((status?.progress ?? 0) * 100)
++  const recSeconds = Math.floor(recorder.durationMs / 1000)
++
++  // ── Render ─────────────────────────────────────────────────────────────
++
++  return (
++    <div className="h-full flex flex-col overflow-y-auto">
++      {/* Header */}
++      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
++        <h3 className="text-sm font-semibold text-text flex items-center gap-2">
++          <Zap size={14} className="text-accent" />
++          Model Testing Studio
++        </h3>
++        <div className="flex items-center gap-1">
++          <button
++            onClick={() => { void loadModels(); void loadPastRuns() }}
++            title="Refresh models"
++            className="p-1.5 text-text-muted hover:text-text rounded hover:bg-elevated transition-colors"
++          >
++            <RefreshCw size={13} className={loadingModels ? 'animate-spin' : ''} />
++          </button>
++        </div>
++      </div>
++
++      {notice && (
++        <div className="mx-3 mt-2 text-[11px] text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded px-2 py-1.5">
++          {notice}
++        </div>
++      )}
++
++      {/* Run controls */}
++      <div className="px-3 py-2 space-y-2 border-b border-border">
++        <div className="flex items-center gap-2">
++          <span className="text-[10px] text-text-muted uppercase tracking-wide">Run on</span>
++          <div className="flex gap-1 bg-elevated rounded-lg p-0.5">
++            <button
++              onClick={() => setDevice('cpu')}
++              disabled={status?.running}
++              className={`flex items-center gap-1 text-[11px] px-2 py-1 rounded-md transition-colors ${device === 'cpu' ? 'bg-accent/15 text-accent font-medium' : 'text-text-muted hover:text-text'}`}
++            >
++              <Cpu size={11} /> CPU
++            </button>
++            <button
++              onClick={() => setDevice('gpu')}
++              disabled={status?.running}
++              className={`flex items-center gap-1 text-[11px] px-2 py-1 rounded-md transition-colors ${device === 'gpu' ? 'bg-accent/15 text-accent font-medium' : 'text-text-muted hover:text-text'}`}
++            >
++              <Monitor size={11} /> GPU
++            </button>
++          </div>
++          <input
++            value={maxTokens}
++            onChange={(e) => setMaxTokens(e.target.value.replace(/[^0-9]/g, ''))}
++            placeholder="max tokens"
++            disabled={status?.running}
++            className="ml-auto w-20 bg-elevated border border-border rounded px-2 py-1 text-[11px] text-text placeholder:text-text-muted focus:outline-none focus:border-accent/50"
++          />
++        </div>
++
++        {/* Prompt selection */}
++        {prompts.length > 0 && (
++          <div className="flex flex-wrap gap-1">
++            {prompts.map((p) => {
++              const on = promptIds.includes(p.id)
++              return (
++                <button
++                  key={p.id}
++                  onClick={() => setPromptIds((prev) => (on ? prev.filter((x) => x !== p.id) : [...prev, p.id]))}
++                  disabled={status?.running}
++                  title={p.prompt}
++                  className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
++                    on ? 'border-accent/50 text-accent bg-accent/10' : 'border-border text-text-muted'
++                  }`}
++                >
++                  {p.label}
++                </button>
++              )
++            })}
++          </div>
++        )}
++
++        <div className="flex items-center gap-2">
++          {!status?.running ? (
++            <button
++              onClick={startRun}
++              disabled={busy || selected.length === 0}
++              className="flex-1 flex items-center justify-center gap-1.5 text-[11px] font-medium py-2 rounded-lg bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40 transition-colors"
++            >
++              {busy ? <RefreshCw size={13} className="animate-spin" /> : <Play size={13} />}
++              Run test ({selected.length})
++            </button>
++          ) : (
++            <button
++              onClick={stopRun}
++              className="flex-1 flex items-center justify-center gap-1.5 text-[11px] font-medium py-2 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors"
++            >
++              <Square size={13} /> Stop
++            </button>
++          )}
++        </div>
++
++        {/* Progress */}
++        {status?.running && (
++          <div className="space-y-1">
++            <div className="flex items-center justify-between text-[10px] text-text-muted">
++              <span className="truncate">
++                {status.current_model || 'starting…'}
++                {status.current_prompt ? ` · ${status.current_prompt}` : ''}
++              </span>
++              <span>{progressPct}%</span>
++            </div>
++            <div className="h-1.5 bg-bg rounded-full overflow-hidden">
++              <div className="h-full bg-accent rounded-full transition-all duration-300" style={{ width: `${progressPct}%` }} />
++            </div>
++          </div>
++        )}
++      </div>
++
++      {/* Recording */}
++      <div className="px-3 py-2 border-b border-border space-y-2">
++        <div className="flex items-center justify-between">
++          <span className="text-[10px] text-text-muted uppercase tracking-wide flex items-center gap-1">
++            <Video size={11} /> Screen recording
++          </span>
++          {recorder.recording && (
++            <span className="text-[10px] text-red-400 flex items-center gap-1">
++              <Circle size={8} className="fill-red-500 text-red-500 animate-pulse" />
++              REC {String(Math.floor(recSeconds / 60)).padStart(2, '0')}:{String(recSeconds % 60).padStart(2, '0')}
++            </span>
++          )}
++        </div>
++
++        {!recorder.supported ? (
++          <div className="text-[10px] text-text-muted">Not supported in this environment.</div>
++        ) : (
++          <>
++            <div className="flex gap-1.5">
++              {!recorder.recording ? (
++                <button
++                  onClick={() => void recorder.start()}
++                  className="flex-1 flex items-center justify-center gap-1.5 text-[11px] py-1.5 rounded-lg bg-elevated border border-border text-text hover:border-accent/40 transition-colors"
++                >
++                  <Video size={12} /> Record screen
++                </button>
++              ) : (
++                <button
++                  onClick={recorder.stop}
++                  className="flex-1 flex items-center justify-center gap-1.5 text-[11px] py-1.5 rounded-lg bg-red-500/15 text-red-400 transition-colors"
++                >
++                  <Square size={12} /> Stop recording
++                </button>
++              )}
++            </div>
++
++            <label className="flex items-center gap-2 text-[10px] text-text-muted cursor-pointer">
++              <input
++                type="checkbox"
++                checked={showHud}
++                onChange={(e) => setShowHud(e.target.checked)}
++                className="accent-accent"
++              />
++              Show live stats overlay in the recording
++            </label>
++
++            {recorder.error && <div className="text-[10px] text-amber-400">{recorder.error}</div>}
++
++            {recorder.blob && (
++              <div className="flex gap-1.5">
++                <button
++                  onClick={() => downloadUrl(recorder.videoUrl!, `gguf-speed-test-${status?.run_id || Date.now()}.webm`)}
++                  className="flex-1 flex items-center justify-center gap-1.5 text-[11px] py-1.5 rounded-lg bg-elevated border border-border text-text hover:border-accent/40 transition-colors"
++                >
++                  <Download size={12} /> Download .webm
++                </button>
++                <button
++                  onClick={() => void recorder.save(`gguf-speed-test-${status?.run_id || Date.now()}.webm`)}
++                  title="Save to disk (Electron)"
++                  className="flex items-center justify-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg bg-elevated border border-border text-text hover:border-accent/40 transition-colors"
++                >
++                  <Save size={12} />
++                </button>
++              </div>
++            )}
++            <div className="text-[9px] text-text-muted">
++              Tip: choose “Entire screen” or this window when the picker opens so the speed test is visible.
++            </div>
++          </>
++        )}
++      </div>
++
++      {/* Live leaderboard */}
++      <div className="px-3 py-2 border-b border-border space-y-2">
++        <div className="flex items-center justify-between">
++          <span className="text-[10px] text-text-muted uppercase tracking-wide flex items-center gap-1">
++            <Trophy size={11} /> Live leaderboard
++          </span>
++          {fastest && <span className="text-[10px] text-emerald-400">{fastest.name}: {fastest.avg_tps.toFixed(1)} tok/s</span>}
++        </div>
++
++        {ranked.length === 0 ? (
++          <div className="text-[10px] text-text-muted py-3 text-center">
++            No measurements yet. Select models and press Run.
++          </div>
++        ) : (
++          <div className="space-y-2">
++            {ranked.map((m, i) => (
++              <div key={m.path} className="space-y-1">
++                <div className="flex items-center gap-2 text-[10px]">
++                  <span className="text-text-muted w-4">{i + 1}.</span>
++                  <span className="text-text flex-1 truncate">{m.name}</span>
++                  <span className="text-text-sec">{m.avg_tps.toFixed(1)} tok/s</span>
++                </div>
++                <div className="flex items-center gap-2">
++                  <div className="flex-1 bg-elevated rounded-full h-3 overflow-hidden">
++                    <div
++                      className="h-full rounded-full transition-all duration-500"
++                      style={{ width: `${(m.avg_tps / maxTps) * 100}%`, backgroundColor: BAR_COLORS[i % BAR_COLORS.length], minWidth: m.avg_tps > 0 ? '4px' : '0' }}
++                    />
++                  </div>
++                  <span className="text-[9px] text-text-muted w-16 text-right">{m.avg_ttft_ms.toFixed(0)}ms TTFT</span>
++                </div>
++                <div className="flex gap-3 text-[9px] text-text-muted pl-6">
++                  <span className="flex items-center gap-0.5"><Clock size={9} /> load {m.load_ms.toFixed(0)}ms</span>
++                  <span>{m.total_tokens} tokens</span>
++                  {m.quantization && <span>{m.quantization}</span>}
++                  {m.n_ctx && <span>ctx {m.n_ctx}</span>}
++                </div>
++              </div>
++            ))}
++          </div>
++        )}
++
++        {/* Per-model status incl. failures */}
++        {models.filter((m) => m.status !== 'ok').length > 0 && (
++          <div className="space-y-1 pt-1">
++            {models.filter((m) => m.status !== 'ok').map((m) => (
++              <div key={m.path} className="flex items-center gap-2 text-[10px]">
++                <span className={statusColor(m.status)}>{m.status}</span>
++                <span className="text-text-muted truncate flex-1">{m.name}</span>
++                {m.error && <span className="text-red-400/80 truncate max-w-[45%]" title={m.error}>{m.error}</span>}
++              </div>
++            ))}
++          </div>
++        )}
++      </div>
++
++      {/* Export + history */}
++      {finished && status?.run_id && (
++        <div className="px-3 py-2 border-b border-border space-y-2">
++          <span className="text-[10px] text-text-muted uppercase tracking-wide flex items-center gap-1">
++            <ImageDown size={11} /> Share this run
++          </span>
++          <div className="flex gap-1.5">
++            {(['json', 'markdown', 'csv'] as const).map((fmt) => (
++              <button
++                key={fmt}
++                onClick={() => downloadUrl(testingApi.exportUrl(status.run_id!, fmt), `gguf-speed-test-${status.run_id}.${fmt === 'markdown' ? 'md' : fmt}`)}
++                className="flex-1 text-[10px] py-1.5 rounded-lg bg-elevated border border-border text-text hover:border-accent/40 transition-colors"
++              >
++                {fmt.toUpperCase()}
++              </button>
++            ))}
++          </div>
++        </div>
++      )}
++
++      {/* Model picker */}
++      <div className="px-3 py-2 border-b border-border space-y-2">
++        <div className="flex items-center justify-between">
++          <span className="text-[10px] text-text-muted uppercase tracking-wide">Models on disk ({candidates.length})</span>
++          <div className="flex gap-2">
++            <button onClick={() => setSelected(candidates.map((c) => c.path))} className="text-[10px] text-accent hover:underline">All</button>
++            <button onClick={() => setSelected([])} className="text-[10px] text-text-muted hover:underline">None</button>
++          </div>
++        </div>
++        {loadingModels ? (
++          <div className="text-[10px] text-text-muted py-3 text-center">Scanning for GGUF models…</div>
++        ) : candidates.length === 0 ? (
++          <div className="text-[10px] text-text-muted py-3 text-center">
++            No .gguf files found. Drop models into your models folder, then refresh.
++          </div>
++        ) : (
++          <div className="space-y-1">
++            {candidates.map((c) => {
++              const on = selected.includes(c.path)
++              return (
++                <label key={c.path} className="flex items-center gap-2 cursor-pointer group">
++                  <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${on ? 'bg-accent/20 border-accent/50' : 'border-border'}`}>
++                    {on && <Check size={10} className="text-accent" />}
++                  </span>
++                  <input type="checkbox" className="hidden" checked={on} onChange={() => toggleModel(c.path)} disabled={status?.running} />
++                  <span className="text-[11px] text-text truncate flex-1 group-hover:text-accent transition-colors" title={c.path}>
++                    {c.filename}
++                  </span>
++                  <span className="text-[9px] text-text-muted">{c.size_human}</span>
++                </label>
++              )
++            })}
++          </div>
++        )}
++      </div>
++
++      {/* Past runs */}
++      {pastRuns.length > 0 && (
++        <div className="px-3 py-2 space-y-1.5">
++          <span className="text-[10px] text-text-muted uppercase tracking-wide">Past runs</span>
++          {pastRuns.slice(0, 8).map((r) => (
++            <button
++              key={r.run_id}
++              onClick={() => downloadUrl(testingApi.exportUrl(r.run_id, 'json'), `gguf-speed-test-${r.run_id}.json`)}
++              className="w-full text-left bg-elevated border border-border rounded-lg px-2.5 py-1.5 hover:border-accent/30 transition-colors"
++            >
++              <div className="flex items-center justify-between text-[10px]">
++                <span className="text-text truncate">{r.model_count} models · {r.device.toUpperCase()}</span>
++                <span className="text-accent">{r.best_tps.toFixed(1)} tok/s</span>
++              </div>
++              <div className="text-[9px] text-text-muted">
++                {r.started_at ? new Date(r.started_at * 1000).toLocaleString() : ''} · {r.status}
++              </div>
++            </button>
++          ))}
++        </div>
++      )}
++
++      {/* Recording HUD — rendered inside the window so it is captured on video */}
++      {recorder.recording && showHud && (
++        <div className="pointer-events-none fixed bottom-4 right-4 z-50 bg-black/80 backdrop-blur border border-white/15 rounded-xl px-4 py-3 text-white shadow-2xl min-w-[220px]">
++          <div className="flex items-center gap-2 mb-2">
++            <Circle size={9} className="fill-red-500 text-red-500 animate-pulse" />
++            <span className="text-[11px] font-semibold tracking-wide">
++              REC {String(Math.floor(recSeconds / 60)).padStart(2, '0')}:{String(recSeconds % 60).padStart(2, '0')}
++            </span>
++            <span className="text-[10px] text-white/60 ml-auto">{(status?.device || device).toUpperCase()}</span>
++          </div>
++          {status?.running && (
++            <div className="text-[10px] text-white/70 mb-2 truncate">
++              {status.current_model}{status.current_prompt ? ` · ${status.current_prompt}` : ''}
++            </div>
++          )}
++          {ranked.slice(0, 4).map((m, i) => (
++            <div key={m.path} className="flex items-center gap-2 text-[11px]">
++              <span className="text-white/50 w-3">{i + 1}</span>
++              <span className="flex-1 truncate">{m.name}</span>
++              <span className="font-mono tabular-nums">{m.avg_tps.toFixed(1)}</span>
++            </div>
++          ))}
++          {ranked.length === 0 && <div className="text-[10px] text-white/60">waiting for results…</div>}
++          <div className="text-[9px] text-white/40 mt-2">tokens/sec on {status?.device || device}</div>
++        </div>
++      )}
++    </div>
++  )
++}
+diff --git a/frontend/src/components/layout/RightPanel.tsx b/frontend/src/components/layout/RightPanel.tsx
+index 5840009..17b2f07 100644
+--- a/frontend/src/components/layout/RightPanel.tsx
++++ b/frontend/src/components/layout/RightPanel.tsx
+@@ -18,6 +18,7 @@ import { WorkspaceManagerPanel } from '../agent/WorkspaceManagerPanel'
+ import { WorkflowBuilderPanel } from '../agent/WorkflowBuilderPanel'
+ import { WorkflowCanvas } from '../agent/WorkflowCanvas'
+ import { BenchmarkPanel } from '../agent/BenchmarkPanel'
++import { TestingStudioPanel } from '../agent/TestingStudioPanel'
+ import { BenchmarkChartPanel } from '../agent/BenchmarkChartPanel'
+ import { CollabPanel } from '../agent/CollabPanel'
+ import { PluginSandboxPanel } from '../agent/PluginSandboxPanel'
+@@ -54,6 +55,7 @@ const COMPONENT_MAP: Record<string, React.ComponentType<any>> = {
+   plugins: PluginMarketplacePanel,
+   sandbox: PluginSandboxPanel,
+   collab: CollabPanel,
++  testing: TestingStudioPanel,
+   benchmark: BenchmarkPanel,
+   benchchart: BenchmarkChartPanel,
+   replay: SessionReplayPanel,
+diff --git a/frontend/src/hooks/useScreenRecorder.ts b/frontend/src/hooks/useScreenRecorder.ts
+new file mode 100644
+index 0000000..7fb5fe2
+--- /dev/null
++++ b/frontend/src/hooks/useScreenRecorder.ts
+@@ -0,0 +1,216 @@
++import { useCallback, useEffect, useRef, useState } from 'react'
++
++/**
++ * Records the screen / app window to a WebM video using the browser's
++ * getDisplayMedia + MediaRecorder APIs. Used by the Model Testing Studio so a
++ * benchmark run can be recorded and shared.
++ *
++ * In a packaged Electron build the finished video can be written straight to
++ * disk through the `save-recording` IPC bridge; in a plain browser it is
++ * offered as a download instead.
++ */
++
++const MIME_CANDIDATES = [
++  'video/webm;codecs=vp9',
++  'video/webm;codecs=vp8',
++  'video/webm',
++]
++
++function pickMimeType(): string {
++  if (typeof MediaRecorder === 'undefined') return ''
++  for (const mime of MIME_CANDIDATES) {
++    try {
++      if (MediaRecorder.isTypeSupported(mime)) return mime
++    } catch {
++      /* isTypeSupported can throw on some builds */
++    }
++  }
++  return ''
++}
++
++export interface ScreenRecorder {
++  supported: boolean
++  recording: boolean
++  error: string | null
++  durationMs: number
++  blob: Blob | null
++  videoUrl: string | null
++  start: () => Promise<void>
++  stop: () => void
++  reset: () => void
++  download: () => void
++  /** Save via Electron when available; returns the saved path (or null). */
++  save: (filename?: string) => Promise<string | null>
++}
++
++export function useScreenRecorder(): ScreenRecorder {
++  const [recording, setRecording] = useState(false)
++  const [error, setError] = useState<string | null>(null)
++  const [durationMs, setDurationMs] = useState(0)
++  const [blob, setBlob] = useState<Blob | null>(null)
++  const [videoUrl, setVideoUrl] = useState<string | null>(null)
++
++  const recorderRef = useRef<MediaRecorder | null>(null)
++  const streamRef = useRef<MediaStream | null>(null)
++  const chunksRef = useRef<Blob[]>([])
++  const startedAtRef = useRef(0)
++  const timerRef = useRef<number | null>(null)
++
++  const supported =
++    typeof navigator !== 'undefined' &&
++    !!navigator.mediaDevices?.getDisplayMedia &&
++    typeof MediaRecorder !== 'undefined'
++
++  const clearTimer = useCallback(() => {
++    if (timerRef.current !== null) {
++      window.clearInterval(timerRef.current)
++      timerRef.current = null
++    }
++  }, [])
++
++  const stopTracks = useCallback(() => {
++    streamRef.current?.getTracks().forEach((t) => t.stop())
++    streamRef.current = null
++  }, [])
++
++  const reset = useCallback(() => {
++    setBlob(null)
++    setVideoUrl((prev) => {
++      if (prev) URL.revokeObjectURL(prev)
++      return null
++    })
++    setDurationMs(0)
++    setError(null)
++  }, [])
++
++  const stop = useCallback(() => {
++    const rec = recorderRef.current
++    if (rec && rec.state !== 'inactive') {
++      rec.stop() // triggers onstop -> blob assembly
++    }
++  }, [])
++
++  const start = useCallback(async () => {
++    if (!supported) {
++      setError('Screen recording is not supported in this environment.')
++      return
++    }
++    setError(null)
++    reset()
++    try {
++      const stream = await navigator.mediaDevices.getDisplayMedia({
++        video: { frameRate: 30 },
++        audio: false,
++      })
++      streamRef.current = stream
++
++      // If the user stops sharing from the browser's own UI, finish cleanly.
++      stream.getVideoTracks().forEach((track) => {
++        track.addEventListener('ended', () => stop())
++      })
++
++      const mimeType = pickMimeType()
++      const rec = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
++      recorderRef.current = rec
++      chunksRef.current = []
++
++      rec.ondataavailable = (e) => {
++        if (e.data && e.data.size > 0) chunksRef.current.push(e.data)
++      }
++
++      rec.onstop = () => {
++        const type = pickMimeType() || 'video/webm'
++        const out = new Blob(chunksRef.current, { type })
++        chunksRef.current = []
++        setBlob(out)
++        setVideoUrl((prev) => {
++          if (prev) URL.revokeObjectURL(prev)
++          return URL.createObjectURL(out)
++        })
++        setRecording(false)
++        clearTimer()
++        setDurationMs(Date.now() - startedAtRef.current)
++        stopTracks()
++      }
++
++      rec.onerror = () => {
++        setError('Recording failed.')
++        setRecording(false)
++        clearTimer()
++        stopTracks()
++      }
++
++      startedAtRef.current = Date.now()
++      rec.start(1000) // gather chunks every second
++      setRecording(true)
++      timerRef.current = window.setInterval(() => {
++        setDurationMs(Date.now() - startedAtRef.current)
++      }, 500)
++    } catch (e) {
++      // The user dismissing the picker also lands here; keep the message short.
++      setError(e instanceof Error ? e.message : 'Could not start screen recording.')
++      setRecording(false)
++      stopTracks()
++    }
++  }, [supported, reset, stop, clearTimer, stopTracks])
++
++  const download = useCallback(() => {
++    if (!videoUrl) return
++    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
++    const a = document.createElement('a')
++    a.href = videoUrl
++    a.download = `gguf-speed-test-${stamp}.webm`
++    document.body.appendChild(a)
++    a.click()
++    a.remove()
++  }, [videoUrl])
++
++  const save = useCallback(
++    async (filename?: string): Promise<string | null> => {
++      if (!blob) return null
++      const api = (window as any).electronAPI
++      const name = filename || `gguf-speed-test-${Date.now()}.webm`
++      if (api?.saveRecording) {
++        try {
++          const buffer = await blob.arrayBuffer()
++          return await api.saveRecording(name, buffer)
++        } catch (e) {
++          setError(e instanceof Error ? e.message : 'Failed to save recording.')
++          return null
++        }
++      }
++      download()
++      return null
++    },
++    [blob, download],
++  )
++
++  useEffect(() => {
++    return () => {
++      clearTimer()
++      const rec = recorderRef.current
++      if (rec && rec.state !== 'inactive') {
++        try {
++          rec.stop()
++        } catch {
++          /* ignore */
++        }
++      }
++      stopTracks()
++    }
++  }, [clearTimer, stopTracks])
++
++  return {
++    supported,
++    recording,
++    error,
++    durationMs,
++    blob,
++    videoUrl,
++    start,
++    stop,
++    reset,
++    download,
++    save,
++  }
++}
+diff --git a/frontend/src/stores/pluginRegistry.ts b/frontend/src/stores/pluginRegistry.ts
+index d4d2a64..eea01a3 100644
+--- a/frontend/src/stores/pluginRegistry.ts
++++ b/frontend/src/stores/pluginRegistry.ts
+@@ -47,6 +47,7 @@ const DEFAULT_PLUGINS: SidebarPlugin[] = [
+ 
+   // Collab
+   { id: 'collab', label: 'Collab', icon: 'Users', category: 'collab', description: 'Real-time collaboration', enabled: false, order: 40 },
++  { id: 'testing', label: 'Testing', icon: 'Zap', category: 'collab', description: 'Run models back-to-back on CPU and record their speed', enabled: true, order: 39 },
+   { id: 'benchmark', label: 'Bench', icon: 'Zap', category: 'collab', description: 'Model benchmarking', enabled: false, order: 41 },
+   { id: 'benchchart', label: 'Charts', icon: 'LineChart', category: 'collab', description: 'Benchmark comparison charts', enabled: false, order: 42 },
+ ]
+diff --git a/ggufloader/_version.py b/ggufloader/_version.py
+index 069a750..889a081 100644
+--- a/ggufloader/_version.py
++++ b/ggufloader/_version.py
+@@ -4,4 +4,4 @@ Kept in its own module so ``ggufloader/__init__.py`` and the entry point can
+ import it without pulling in PySide6 or the rest of the app (no import cycles).
+ """
+ 
+-__version__ = "2.3.0"
++__version__ = "2.4.0"
+diff --git a/ggufloader/api/routes/benchmark.py b/ggufloader/api/routes/benchmark.py
+index fe558bf..cb00c6d 100644
+--- a/ggufloader/api/routes/benchmark.py
++++ b/ggufloader/api/routes/benchmark.py
+@@ -1,15 +1,31 @@
+-"""Benchmark routes - model performance benchmarking."""
++"""Benchmark routes - model performance benchmarking + the Model Testing Studio.
++
++The Studio endpoints (``/suite/*``) run a *suite* of GGUF models back-to-back
++on CPU, measure real tokens/sec + TTFT, and expose live progress for the UI.
++They deliberately bypass the pinned-model load gate (see
++``ggufloader/core/testing/runner.py``); the app's global chat backend is freed
++before a run and reloaded afterwards so only one ``Llama`` exists at a time.
++"""
+ 
+ from __future__ import annotations
+ 
+ import logging
++import threading
++from typing import Any, Dict, List, Optional
+ 
+-from fastapi import APIRouter
++from fastapi import APIRouter, HTTPException
++from fastapi.responses import PlainTextResponse
++from pydantic import BaseModel
+ 
+ router = APIRouter()
+ logger = logging.getLogger(__name__)
+ 
+ 
++# ============================================================================
++# Existing benchmark report/history routes
++# ============================================================================
++
++
+ @router.get("/prompts")
+ async def list_prompts() -> list:
+     """List available benchmark prompts."""
+@@ -41,6 +57,265 @@ async def get_report(report_id: str) -> dict:
+     bm = ModelBenchmark()
+     report = bm.get_report(report_id)
+     if not report:
+-        from fastapi import HTTPException
+         raise HTTPException(status_code=404, detail="Report not found")
+     return report
++
++
++# ============================================================================
++# Model Testing Studio
++# ============================================================================
++
++
++class SuiteRunRequest(BaseModel):
++    """Request body for starting a multi-model test run."""
++
++    paths: List[str]
++    device: str = "cpu"                     # "cpu" (default) or "gpu"
++    prompt_ids: Optional[List[str]] = None  # subset of SUITE_PROMPTS; None = all
++    max_tokens: Optional[int] = None        # override per-prompt cap
++    n_ctx: Optional[int] = None             # None = router picks
++
++
++class _RunState:
++    """Module-level holder for the single active/last test run."""
++
++    def __init__(self) -> None:
++        self.lock = threading.Lock()
++        self.runner = None            # SuiteRunner of the active/last run
++        self.thread: Optional[threading.Thread] = None
++        self.snapshot: Optional[Dict[str, Any]] = None
++
++    def is_running(self) -> bool:
++        return self.thread is not None and self.thread.is_alive()
++
++
++_state = _RunState()
++
++
++def _free_global_backend() -> None:
++    """Unload the pinned chat model so the suite owns the only Llama."""
++    from ggufloader.api.deps import get_model_backend, set_model_backend
++
++    backend = get_model_backend()
++    if backend is None:
++        return
++    try:
++        backend.unload()
++    except Exception as e:  # noqa: BLE001 - freeing memory is best-effort
++        logger.warning("Failed to unload chat backend before suite run: %s", e)
++    set_model_backend(None)
++
++
++def _reload_pinned_async() -> None:
++    """Ask the startup auto-loader to reload the pinned model in the background."""
++    try:
++        from ggufloader.api.auto_load import start_auto_load
++
++        start_auto_load(force=True)
++    except Exception as e:  # noqa: BLE001 - reload is best-effort
++        logger.warning("Failed to re-trigger auto-load after suite run: %s", e)
++
++
++@router.get("/suite/prompts")
++async def suite_prompts() -> list:
++    """The fixed prompt workload used by every model in a test run."""
++    from ggufloader.core.testing.runner import SUITE_PROMPTS
++
++    return [p.to_dict() for p in SUITE_PROMPTS]
++
++
++@router.get("/suite/models")
++async def suite_models(directory: Optional[str] = None) -> dict:
++    """Candidate GGUF models on disk (reuses the model catalog scan)."""
++    from ggufloader.api.routes.model import model_catalog
++
++    catalog = await model_catalog(directory=directory, recursive=True)
++    models = [
++        {
++            "path": m["path"],
++            "filename": m["filename"],
++            "size_gb": m.get("size_gb", 0),
++            "size_human": m.get("size_human", ""),
++            "architecture": m.get("architecture", ""),
++            "quantization": m.get("quantization", ""),
++            "family": m.get("family", ""),
++        }
++        for m in catalog.get("models", [])
++    ]
++    return {"directory": catalog.get("directory"), "count": len(models), "models": models}
++
++
++@router.post("/suite/run")
++async def suite_run(req: SuiteRunRequest) -> dict:
++    """Start a test run over the given models (background thread)."""
++    from ggufloader.core.testing.runner import SuiteRunner, SuiteStore
++
++    if not req.paths:
++        raise HTTPException(status_code=400, detail="No models selected")
++
++    device = "gpu" if str(req.device).lower() == "gpu" else "cpu"
++
++    with _state.lock:
++        if _state.is_running():
++            raise HTTPException(status_code=409, detail="A test run is already in progress")
++
++        _free_global_backend()
++
++        runner = SuiteRunner()
++        _state.runner = runner
++        _state.snapshot = None
++
++        def _worker() -> None:
++            store = SuiteStore()
++            try:
++                run = runner.run(
++                    req.paths,
++                    device=device,
++                    prompt_ids=req.prompt_ids,
++                    max_tokens=req.max_tokens,
++                    n_ctx=req.n_ctx,
++                )
++                store.save(run)
++                with _state.lock:
++                    _state.snapshot = run.to_dict()
++                logger.info(
++                    "Test run %s finished: %d model(s), %.1fs",
++                    run.run_id, len(run.models), run.duration_ms / 1000,
++                )
++            except Exception as e:  # noqa: BLE001 - surface failures to the UI
++                logger.error("Test run failed: %s", e)
++                with _state.lock:
++                    _state.snapshot = {
++                        "run_id": None, "status": "error", "error": str(e),
++                        "device": device, "models": [], "leaderboard": [],
++                    }
++            finally:
++                _reload_pinned_async()
++
++        thread = threading.Thread(target=_worker, daemon=True, name="model-suite-run")
++        _state.thread = thread
++        thread.start()
++
++    return {"status": "running", "device": device, "model_count": len(req.paths)}
++
++
++@router.get("/suite/status")
++async def suite_status() -> dict:
++    """Live status of the current run (or the last finished one)."""
++    with _state.lock:
++        runner = _state.runner
++        if runner is not None and runner.last_run is not None and _state.is_running():
++            return {"running": True, **runner.last_run.to_dict()}
++        if _state.snapshot is not None:
++            return {"running": _state.is_running(), **_state.snapshot}
++        if runner is not None and runner.last_run is not None:
++            return {"running": False, **runner.last_run.to_dict()}
++    return {"running": False, "status": "idle", "models": [], "leaderboard": []}
++
++
++@router.post("/suite/cancel")
++async def suite_cancel() -> dict:
++    """Cooperatively cancel the active run."""
++    with _state.lock:
++        runner = _state.runner
++        if runner is None or not _state.is_running():
++            return {"status": "idle", "message": "No run in progress"}
++        runner.cancel()
++    return {"status": "cancelling"}
++
++
++@router.get("/suite/runs")
++async def suite_runs(limit: int = 20) -> list:
++    """List saved test runs (newest first)."""
++    from ggufloader.core.testing.runner import SuiteStore
++
++    return SuiteStore().list(limit)
++
++
++@router.get("/suite/runs/{run_id}")
++async def suite_run_detail(run_id: str) -> dict:
++    """Fetch one saved test run."""
++    from ggufloader.core.testing.runner import SuiteStore
++
++    data = SuiteStore().get(run_id)
++    if not data:
++        raise HTTPException(status_code=404, detail="Run not found")
++    return data
++
++
++@router.get("/suite/runs/{run_id}/export")
++async def suite_export(run_id: str, format: str = "json"):
++    """Export a saved run as json | markdown | csv."""
++    from ggufloader.core.testing.runner import SuiteStore, export_csv, export_markdown
++
++    data = SuiteStore().get(run_id)
++    if not data:
++        raise HTTPException(status_code=404, detail="Run not found")
++
++    fmt = (format or "json").lower()
++    if fmt == "json":
++        import json
++
++        return PlainTextResponse(
++            json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json"
++        )
++
++    run = _run_from_dict(data)
++    if fmt == "markdown":
++        return PlainTextResponse(export_markdown(run), media_type="text/markdown")
++    if fmt == "csv":
++        return PlainTextResponse(export_csv(run), media_type="text/csv")
++    raise HTTPException(status_code=400, detail=f"Unknown format: {format}")
++
++
++@router.post("/run")
++async def run_single(req: SuiteRunRequest) -> dict:
++    """Single-model convenience run: starts a one-model suite.
++
++    Kept for the existing ``benchmarkApi.run`` client call.
++    """
++    return await suite_run(req)
++
++
++def _run_from_dict(data: Dict[str, Any]) -> Any:
++    """Rebuild a SuiteRun from its serialized dict (for exports)."""
++    from ggufloader.core.testing.runner import ModelResult, PromptResult, SuiteRun
++
++    run = SuiteRun(
++        run_id=data.get("run_id", ""),
++        device=data.get("device", "cpu"),
++        status=data.get("status", "done"),
++        started_at=data.get("started_at", 0.0),
++        finished_at=data.get("finished_at", 0.0),
++        error=data.get("error"),
++        progress=data.get("progress", 1.0),
++    )
++    for m in data.get("models", []):
++        model = ModelResult(
++            path=m.get("path", ""),
++            name=m.get("name", ""),
++            status=m.get("status", "pending"),
++            error=m.get("error"),
++            size_gb=m.get("size_gb", 0.0),
++            architecture=m.get("architecture", ""),
++            quantization=m.get("quantization", ""),
++            parameters=m.get("parameters", ""),
++            n_ctx=m.get("n_ctx"),
++            device=m.get("device", "cpu"),
++            load_ms=m.get("load_ms", 0.0),
++        )
++        for p in m.get("prompts", []):
++            model.prompts.append(
++                PromptResult(
++                    prompt_id=p.get("prompt_id", ""),
++                    label=p.get("label", ""),
++                    tokens_generated=p.get("tokens_generated", 0),
++                    ttft_ms=p.get("ttft_ms", 0.0),
++                    gen_time_ms=p.get("gen_time_ms", 0.0),
++                    tokens_per_second=p.get("tokens_per_second", 0.0),
++                    text=p.get("text", ""),
++                    error=p.get("error"),
++                )
++            )
++        run.models.append(model)
++    return run
+diff --git a/ggufloader/core/testing/__init__.py b/ggufloader/core/testing/__init__.py
+new file mode 100644
+index 0000000..593c356
+--- /dev/null
++++ b/ggufloader/core/testing/__init__.py
+@@ -0,0 +1,30 @@
++"""Model Testing Studio - run a suite of GGUF models and measure real CPU speed.
++
++See ``runner.py`` for the engine and
++``docs/superpowers/specs/2026-10-16-model-testing-studio-design.md`` for the
++design.
++"""
++
++from ggufloader.core.testing.runner import (
++    ModelResult,
++    PromptResult,
++    SuitePrompt,
++    SuiteRun,
++    SuiteRunner,
++    SuiteStore,
++    SUITE_PROMPTS,
++    export_csv,
++    export_markdown,
++)
++
++__all__ = [
++    "ModelResult",
++    "PromptResult",
++    "SuitePrompt",
++    "SuiteRun",
++    "SuiteRunner",
++    "SuiteStore",
++    "SUITE_PROMPTS",
++    "export_csv",
++    "export_markdown",
++]
+diff --git a/ggufloader/core/testing/runner.py b/ggufloader/core/testing/runner.py
+new file mode 100644
+index 0000000..d35269a
+--- /dev/null
++++ b/ggufloader/core/testing/runner.py
+@@ -0,0 +1,646 @@
++"""Model Testing Studio - run a suite of GGUF models back-to-back and measure speed.
++
++This is the engine behind the "Testing" panel. For every selected GGUF it:
++
++1. loads the model (CPU by default) and times the load,
++2. runs a fixed prompt workload through it,
++3. measures **real** time-to-first-token (TTFT) and decode throughput
++   (tokens/sec) from llama.cpp's own stream,
++4. unloads the model before moving to the next one,
++5. records everything into a :class:`SuiteRun` report.
++
++Design notes
++------------
++* The runner never touches the app's pinned chat model. The API layer frees
++  the global backend before a run and re-triggers the startup auto-loader
++  afterwards, so at most one ``Llama`` instance exists at any time (see
++  AGENTS.md, invariant 1).
++* All model I/O goes through injected callables (``load_fn`` / ``unload_fn`` /
++  ``clock``), so the whole engine is unit-testable headless with a fake
++  backend - no model, no GPU, no llama.cpp.
++"""
++
++from __future__ import annotations
++
++import csv
++import io
++import json
++import logging
++import threading
++import time
++import uuid
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++
++# ============================================================================
++# Fixed workload
++# ============================================================================
++
++
++@dataclass
++class SuitePrompt:
++    """One prompt in the fixed benchmark workload."""
++
++    id: str
++    label: str
++    prompt: str
++    max_tokens: int = 128
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "id": self.id,
++            "label": self.label,
++            "prompt": self.prompt,
++            "max_tokens": self.max_tokens,
++        }
++
++
++# Kept intentionally small and fixed so every model does exactly the same
++# work and the speed numbers are directly comparable.
++SUITE_PROMPTS: List[SuitePrompt] = [
++    SuitePrompt(
++        id="short",
++        label="Short answer",
++        prompt="In one sentence, explain why the sky is blue.",
++        max_tokens=64,
++    ),
++    SuitePrompt(
++        id="medium",
++        label="Medium answer",
++        prompt="List five benefits of regular exercise. One short line each.",
++        max_tokens=128,
++    ),
++    SuitePrompt(
++        id="code",
++        label="Code answer",
++        prompt=(
++            "Write a Python function that returns the nth Fibonacci number. "
++            "Include a short docstring and one usage example."
++        ),
++        max_tokens=160,
++    ),
++]
++
++
++# ============================================================================
++# Result dataclasses
++# ============================================================================
++
++
++@dataclass
++class PromptResult:
++    """Measured performance of one prompt on one model."""
++
++    prompt_id: str
++    label: str
++    tokens_generated: int
++    ttft_ms: float
++    gen_time_ms: float
++    tokens_per_second: float
++    text: str = ""
++    error: Optional[str] = None
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "prompt_id": self.prompt_id,
++            "label": self.label,
++            "tokens_generated": self.tokens_generated,
++            "ttft_ms": round(self.ttft_ms, 1),
++            "gen_time_ms": round(self.gen_time_ms, 1),
++            "tokens_per_second": round(self.tokens_per_second, 2),
++            "text": self.text,
++            "error": self.error,
++        }
++
++
++@dataclass
++class ModelResult:
++    """Aggregate result for one model across the whole workload."""
++
++    path: str
++    name: str
++    status: str = "pending"  # pending|loading|running|ok|error|cancelled
++    error: Optional[str] = None
++    size_gb: float = 0.0
++    architecture: str = ""
++    quantization: str = ""
++    parameters: str = ""
++    n_ctx: Optional[int] = None
++    device: str = "cpu"
++    load_ms: float = 0.0
++    prompts: List[PromptResult] = field(default_factory=list)
++
++    @property
++    def avg_tps(self) -> float:
++        vals = [p.tokens_per_second for p in self.prompts if p.error is None]
++        return sum(vals) / len(vals) if vals else 0.0
++
++    @property
++    def avg_ttft_ms(self) -> float:
++        vals = [p.ttft_ms for p in self.prompts if p.error is None]
++        return sum(vals) / len(vals) if vals else 0.0
++
++    @property
++    def total_tokens(self) -> int:
++        return sum(p.tokens_generated for p in self.prompts)
++
++    @property
++    def gen_time_ms(self) -> float:
++        return sum(p.gen_time_ms for p in self.prompts)
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "path": self.path,
++            "name": self.name,
++            "status": self.status,
++            "error": self.error,
++            "size_gb": self.size_gb,
++            "architecture": self.architecture,
++            "quantization": self.quantization,
++            "parameters": self.parameters,
++            "n_ctx": self.n_ctx,
++            "device": self.device,
++            "load_ms": round(self.load_ms, 1),
++            "prompts": [p.to_dict() for p in self.prompts],
++            "prompt_count": len(self.prompts),
++            "avg_tps": round(self.avg_tps, 2),
++            "avg_ttft_ms": round(self.avg_ttft_ms, 1),
++            "total_tokens": self.total_tokens,
++            "gen_time_ms": round(self.gen_time_ms, 1),
++        }
++
++
++@dataclass
++class SuiteRun:
++    """A complete multi-model test run."""
++
++    run_id: str
++    device: str = "cpu"
++    status: str = "queued"  # queued|running|done|cancelled|error
++    started_at: float = 0.0
++    finished_at: float = 0.0
++    error: Optional[str] = None
++    current_model: str = ""
++    current_prompt: str = ""
++    progress: float = 0.0
++    models: List[ModelResult] = field(default_factory=list)
++
++    @property
++    def duration_ms(self) -> float:
++        if not self.started_at:
++            return 0.0
++        end = self.finished_at or time.time()
++        return (end - self.started_at) * 1000
++
++    def leaderboard(self) -> List[Dict[str, Any]]:
++        """Rank models that produced numbers, fastest first."""
++        ranked = [m for m in self.models if m.status == "ok" and m.prompts]
++        ranked.sort(key=lambda m: m.avg_tps, reverse=True)
++        return [
++            {"rank": i + 1, "name": m.name, "avg_tps": round(m.avg_tps, 2)}
++            for i, m in enumerate(ranked)
++        ]
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "run_id": self.run_id,
++            "device": self.device,
++            "status": self.status,
++            "started_at": self.started_at,
++            "finished_at": self.finished_at,
++            "duration_ms": round(self.duration_ms, 1),
++            "error": self.error,
++            "current_model": self.current_model,
++            "current_prompt": self.current_prompt,
++            "progress": round(self.progress, 3),
++            "models": [m.to_dict() for m in self.models],
++            "leaderboard": self.leaderboard(),
++        }
++
++
++# ============================================================================
++# Token / stream helpers
++# ============================================================================
++
++
++def _count_tokens(backend: Any, text: str) -> int:
++    """Count tokens with the model's tokenizer, falling back to chars/4."""
++    if not text:
++        return 0
++    fn = getattr(backend, "count_tokens", None)
++    if callable(fn):
++        try:
++            return int(fn(text))
++        except Exception:  # noqa: BLE001 - a bad tokenizer must not kill a run
++            pass
++    return max(1, len(text) // 4)
++
++
++def _iter_text(backend: Any, prompt: str, max_tokens: int):
++    """Yield plain text pieces from a backend stream (accepts token dicts)."""
++    stream = backend.generate_stream(prompt, max_tokens=max_tokens, temperature=0.0)
++    for piece in stream:
++        if isinstance(piece, dict):
++            choices = piece.get("choices") or [{}]
++            piece = choices[0].get("text", "")
++        if piece:
++            yield piece
++
++
++def _default_load(path: str, *, use_gpu: bool, n_ctx: Optional[int]) -> Tuple[Any, Any, Any]:
++    """Default loader: router-driven load (inspect -> plan -> load ladder).
++
++    Imported lazily so importing this module never drags in llama.cpp or the
++    API layer.
++    """
++    from ggufloader.api.deps import get_router
++    from ggufloader.core.router import ModelRole
++
++    router = get_router()
++    backend, profile, strategy, _config = router.load(
++        path, ModelRole.CHAT, n_ctx=n_ctx, use_gpu=use_gpu
++    )
++    return backend, profile, strategy
++
++
++def _default_unload(backend: Any) -> None:
++    try:
++        backend.unload()
++    except Exception as e:  # noqa: BLE001 - unloading must never mask the next model
++        logger.warning("Failed to unload benchmark model: %s", e)
++
++
++# ============================================================================
++# Runner
++# ============================================================================
++
++
++class SuiteRunner:
++    """Loads each model in turn, benchmarks it, unloads it, and reports.
++
++    All I/O is injected so the engine is fully headless-testable:
++
++    * ``load_fn(path, *, use_gpu, n_ctx) -> (backend, profile, strategy)``
++    * ``unload_fn(backend) -> None``
++    * ``clock() -> float`` (monotonic seconds)
++    """
++
++    def __init__(
++        self,
++        load_fn: Optional[Callable[..., Tuple[Any, Any, Any]]] = None,
++        unload_fn: Optional[Callable[[Any], None]] = None,
++        clock: Callable[[], float] = time.perf_counter,
++    ) -> None:
++        self._load_fn = load_fn or _default_load
++        self._unload_fn = unload_fn or _default_unload
++        self._clock = clock
++        self._cancel = threading.Event()
++        # The live run object, mutated in place, so an API layer can poll it.
++        self.last_run: Optional[SuiteRun] = None
++
++    def cancel(self) -> None:
++        """Request cancellation; the run loop checks between pieces."""
++        self._cancel.set()
++
++    @property
++    def cancelled(self) -> bool:
++        return self._cancel.is_set()
++
++    def run(
++        self,
++        paths: List[str],
++        *,
++        device: str = "cpu",
++        prompt_ids: Optional[List[str]] = None,
++        max_tokens: Optional[int] = None,
++        n_ctx: Optional[int] = None,
++        run_id: Optional[str] = None,
++        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
++    ) -> SuiteRun:
++        """Run the whole suite and return the completed :class:`SuiteRun`.
++
++        ``device`` is ``"cpu"`` (use_gpu=False) or ``"gpu"`` (use_gpu=True).
++        ``prompt_ids`` selects a subset of :data:`SUITE_PROMPTS`.
++        ``max_tokens`` overrides each prompt's own cap when provided.
++        """
++        prompts = self._select_prompts(prompt_ids)
++        use_gpu = device == "gpu"
++        run = SuiteRun(
++            run_id=run_id or uuid.uuid4().hex[:12],
++            device=device,
++            status="running",
++            started_at=time.time(),
++        )
++        self.last_run = run
++        for path in paths:
++            run.models.append(
++                ModelResult(
++                    path=path,
++                    name=Path(path).stem or path,
++                    device=device,
++                )
++            )
++        self._emit(on_event, {"type": "run_start", "run": run.to_dict()})
++
++        total_units = max(1, len(run.models) * max(1, len(prompts)))
++        done_units = 0
++
++        for model in run.models:
++            if self._cancel.is_set():
++                model.status = "cancelled"
++                continue
++
++            run.current_model = model.name
++            model.status = "loading"
++            self._emit(on_event, {"type": "model_start", "model": model.to_dict()})
++
++            backend: Any = None
++            try:
++                load_start = self._clock()
++                backend, profile, strategy = self._load_fn(
++                    model.path, use_gpu=use_gpu, n_ctx=n_ctx
++                )
++                model.load_ms = (self._clock() - load_start) * 1000
++                self._apply_profile(model, profile, strategy)
++                model.status = "running"
++            except Exception as e:  # noqa: BLE001 - one bad model must not end the run
++                model.status = "error"
++                model.error = str(e)
++                logger.warning("Benchmark load failed for %s: %s", model.path, e)
++                done_units += len(prompts)
++                run.progress = done_units / total_units
++                self._emit(on_event, {"type": "model_done", "model": model.to_dict()})
++                continue
++
++            try:
++                for prompt in prompts:
++                    if self._cancel.is_set():
++                        model.status = "cancelled"
++                        break
++                    run.current_prompt = prompt.id
++                    result = self._benchmark_prompt(backend, prompt, max_tokens)
++                    model.prompts.append(result)
++                    done_units += 1
++                    run.progress = done_units / total_units
++                    self._emit(
++                        on_event,
++                        {
++                            "type": "prompt_done",
++                            "model": model.to_dict(),
++                            "prompt": result.to_dict(),
++                        },
++                    )
++                if model.status == "running":
++                    model.status = "ok"
++            finally:
++                self._unload_fn(backend)
++
++            run.current_prompt = ""
++            self._emit(on_event, {"type": "model_done", "model": model.to_dict()})
++
++        run.current_model = ""
++        run.finished_at = time.time()
++        run.progress = 1.0
++        if self._cancel.is_set():
++            run.status = "cancelled"
++        else:
++            run.status = "done"
++        self._emit(on_event, {"type": "run_done", "run": run.to_dict()})
++        return run
++
++    # ------------------------------------------------------------------
++    # Internals
++    # ------------------------------------------------------------------
++
++    def _select_prompts(self, prompt_ids: Optional[List[str]]) -> List[SuitePrompt]:
++        if not prompt_ids:
++            return list(SUITE_PROMPTS)
++        wanted = set(prompt_ids)
++        selected = [p for p in SUITE_PROMPTS if p.id in wanted]
++        return selected or list(SUITE_PROMPTS)
++
++    def _benchmark_prompt(
++        self, backend: Any, prompt: SuitePrompt, max_tokens: Optional[int]
++    ) -> PromptResult:
++        cap = int(max_tokens) if max_tokens else prompt.max_tokens
++        start = self._clock()
++        first_at: Optional[float] = None
++        last_at: Optional[float] = None
++        pieces: List[str] = []
++        error: Optional[str] = None
++        try:
++            for piece in _iter_text(backend, prompt.prompt, cap):
++                now = self._clock()
++                if first_at is None:
++                    first_at = now
++                last_at = now
++                pieces.append(piece)
++        except Exception as e:  # noqa: BLE001 - record and keep going
++            error = str(e)
++            logger.warning("Benchmark generation failed (%s): %s", prompt.id, e)
++
++        text = "".join(pieces)
++        tokens = _count_tokens(backend, text)
++
++        if first_at is not None:
++            ttft_ms = (first_at - start) * 1000
++            gen_ms = max(0.0, ((last_at or first_at) - first_at) * 1000)
++        else:
++            ttft_ms = (self._clock() - start) * 1000
++            gen_ms = 0.0
++        tps = (tokens / (gen_ms / 1000.0)) if gen_ms > 0 else 0.0
++
++        return PromptResult(
++            prompt_id=prompt.id,
++            label=prompt.label,
++            tokens_generated=tokens,
++            ttft_ms=ttft_ms,
++            gen_time_ms=gen_ms,
++            tokens_per_second=tps,
++            text=text[:400],
++            error=error,
++        )
++
++    @staticmethod
++    def _apply_profile(model: ModelResult, profile: Any, strategy: Any) -> None:
++        """Copy architecture/quant/ctx from the router profile onto the result."""
++        if profile is not None:
++            model.architecture = getattr(profile, "architecture", "") or ""
++            model.quantization = getattr(profile, "quantization", "") or ""
++            model.parameters = getattr(profile, "param_count_estimate", "") or ""
++            size_gb = getattr(profile, "file_size_gb", 0.0) or 0.0
++            model.size_gb = round(float(size_gb), 2)
++        if strategy is not None:
++            model.n_ctx = getattr(strategy, "n_ctx", None) or model.n_ctx
++
++    @staticmethod
++    def _emit(on_event: Optional[Callable[[Dict[str, Any]], None]], event: Dict[str, Any]) -> None:
++        if on_event is None:
++            return
++        try:
++            on_event(event)
++        except Exception as e:  # noqa: BLE001 - a UI callback must not break a run
++            logger.debug("Suite event callback failed: %s", e)
++
++
++# ============================================================================
++# Persistence
++# ============================================================================
++
++
++class SuiteStore:
++    """Save, list, and load suite runs as JSON files."""
++
++    def __init__(self, root: Optional[Path] = None) -> None:
++        self.root = Path(root) if root else Path.home() / ".ggufloader" / "benchmarks" / "suites"
++        try:
++            self.root.mkdir(parents=True, exist_ok=True)
++        except Exception as e:  # noqa: BLE001 - read-only home must not crash the app
++            logger.warning("Could not create suite store dir %s: %s", self.root, e)
++
++    def save(self, run: SuiteRun) -> Path:
++        path = self.root / f"{run.run_id}.json"
++        path.write_text(
++            json.dumps(run.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
++        )
++        return path
++
++    def get(self, run_id: str) -> Optional[Dict[str, Any]]:
++        path = self.root / f"{run_id}.json"
++        if not path.exists():
++            return None
++        try:
++            return json.loads(path.read_text(encoding="utf-8"))
++        except Exception as e:  # noqa: BLE001 - corrupt file should not raise
++            logger.warning("Failed to read suite run %s: %s", run_id, e)
++            return None
++
++    def list(self, limit: int = 20) -> List[Dict[str, Any]]:
++        runs: List[Dict[str, Any]] = []
++        try:
++            files = sorted(self.root.glob("*.json"), reverse=True)
++        except Exception:  # noqa: BLE001
++            return runs
++        for f in files[:limit]:
++            try:
++                data = json.loads(f.read_text(encoding="utf-8"))
++            except Exception:  # noqa: BLE001
++                continue
++            models = data.get("models", [])
++            runs.append(
++                {
++                    "run_id": data.get("run_id", f.stem),
++                    "status": data.get("status", ""),
++                    "device": data.get("device", ""),
++                    "started_at": data.get("started_at", 0),
++                    "duration_ms": data.get("duration_ms", 0),
++                    "model_count": len(models),
++                    "best_tps": max((m.get("avg_tps", 0) for m in models), default=0),
++                    "leaderboard": data.get("leaderboard", []),
++                }
++            )
++        return runs
++
++
++# ============================================================================
++# Exports
++# ============================================================================
++
++
++def export_markdown(run: SuiteRun) -> str:
++    """Render a run as a shareable Markdown report."""
++    lines: List[str] = []
++    lines.append(f"# Model speed test ({run.device.upper()})")
++    lines.append("")
++    lines.append(f"- Run: `{run.run_id}`")
++    lines.append(f"- Status: {run.status}")
++    lines.append(f"- Duration: {run.duration_ms / 1000:.1f}s")
++    lines.append("")
++    lines.append("## Leaderboard")
++    lines.append("")
++    lines.append("| Rank | Model | Tokens/sec | TTFT (ms) | Load (ms) |")
++    lines.append("| ---: | :---- | ---------: | --------: | --------: |")
++    ranked = sorted(
++        [m for m in run.models if m.prompts],
++        key=lambda m: m.avg_tps,
++        reverse=True,
++    )
++    for i, m in enumerate(ranked):
++        lines.append(
++            f"| {i + 1} | {m.name} | {m.avg_tps:.2f} | {m.avg_ttft_ms:.0f} | {m.load_ms:.0f} |"
++        )
++    failed = [m for m in run.models if m.status == "error"]
++    if failed:
++        lines.append("")
++        lines.append("## Failed models")
++        lines.append("")
++        for m in failed:
++            lines.append(f"- {m.name}: {m.error}")
++    lines.append("")
++    return "\n".join(lines)
++
++
++def export_csv(run: SuiteRun) -> str:
++    """Render a run as CSV, one row per model/prompt measurement."""
++    buf = io.StringIO()
++    writer = csv.writer(buf)
++    writer.writerow(
++        [
++            "run_id",
++            "device",
++            "model",
++            "architecture",
++            "quantization",
++            "load_ms",
++            "prompt_id",
++            "tokens_generated",
++            "ttft_ms",
++            "gen_time_ms",
++            "tokens_per_second",
++            "status",
++            "error",
++        ]
++    )
++    for m in run.models:
++        if m.prompts:
++            for p in m.prompts:
++                writer.writerow(
++                    [
++                        run.run_id,
++                        run.device,
++                        m.name,
++                        m.architecture,
++                        m.quantization,
++                        f"{m.load_ms:.1f}",
++                        p.prompt_id,
++                        p.tokens_generated,
++                        f"{p.ttft_ms:.1f}",
++                        f"{p.gen_time_ms:.1f}",
++                        f"{p.tokens_per_second:.2f}",
++                        m.status,
++                        m.error or p.error or "",
++                    ]
++                )
++        else:
++            writer.writerow(
++                [
++                    run.run_id,
++                    run.device,
++                    m.name,
++                    m.architecture,
++                    m.quantization,
++                    f"{m.load_ms:.1f}",
++                    "",
++                    "",
++                    "",
++                    "",
++                    "",
++                    m.status,
++                    m.error or "",
++                ]
++            )
++    return buf.getvalue()
+diff --git a/progress.md b/progress.md
+index 1a130f9..15b4eac 100644
+--- a/progress.md
++++ b/progress.md
+@@ -1,5 +1,28 @@
+ # Session Progress Log
+ 
++## Session: 2026-10-16 - Model Testing Studio
++
++**Added:** a multi-model benchmarking mode so the app can run several GGUF
++models back-to-back on CPU, show their real speed, and record the screen.
++
++- `ggufloader/core/testing/runner.py` - `SuiteRunner` (load -> run -> unload,
++  real TTFT + tokens/sec), `SuiteStore`, `export_markdown` / `export_csv`.
++- `ggufloader/api/routes/benchmark.py` - `/api/benchmark/suite/*` routes
++  (prompts, models, run, status, cancel, runs, export) plus `/api/benchmark/run`.
++- `frontend/src/components/agent/TestingStudioPanel.tsx` - model picker, run
++  controls, live leaderboard, recording controls, exports; registered as the
++  `testing` sidebar plugin.
++- `frontend/src/hooks/useScreenRecorder.ts` - getDisplayMedia + MediaRecorder
++  to `.webm`; `electron/main.ts` + `preload.ts` gained a `save-recording` IPC.
++
++**Verified:** `pytest tests/unit` (20 new tests pass; the only failures are the
++pre-existing `llama-cpp-python`/`PySide6`-dependent ones, identical on a clean
++clone), `tsc -b` + `vite build` clean, `electron` `tsc --noEmit` clean, and a
++thrown-away TestClient script exercised every new endpoint (19/19 checks).
++
++**Next:** real-model validation on a machine with llama.cpp + GGUFs; optional
++GPU parity and in-video chart compositing.
++
+ ## Current State
+ 
+ **Last Updated:** 2026-08-27
+diff --git a/pyproject.toml b/pyproject.toml
+index c7f30ce..6590712 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "ggufloader"
+-version = "2.3.0"
++version = "2.4.0"
+ description = "Advanced GGUF Model Loader with Smart Floating Assistant"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/tests/unit/test_testing_studio.py b/tests/unit/test_testing_studio.py
+new file mode 100644
+index 0000000..2dc1883
+--- /dev/null
++++ b/tests/unit/test_testing_studio.py
+@@ -0,0 +1,299 @@
++"""Tests for the Model Testing Studio (multi-model CPU speed benchmarking).
++
++Fully headless: a fake backend + injected clock stand in for llama.cpp, so
++no model, GPU, or real inference is required.
++"""
++
++from __future__ import annotations
++
++import types
++
++import pytest
++
++from ggufloader.core.testing.runner import (
++    SUITE_PROMPTS,
++    ModelResult,
++    PromptResult,
++    SuitePrompt,
++    SuiteRun,
++    SuiteRunner,
++    SuiteStore,
++    export_csv,
++    export_markdown,
++)
++
++
++# ── Test doubles ─────────────────────────────────────────────────────────
++
++
++class FakeBackend:
++    """Minimal backend: yields a fixed number of text pieces."""
++
++    def __init__(self, pieces=("Hello ", "world"), tokens=6, fail_load=False):
++        self.pieces = list(pieces)
++        self._tokens = tokens
++        self.fail_load = fail_load
++        self.unloaded = False
++        self.calls = []
++
++    def generate_stream(self, prompt: str, **kwargs):
++        self.calls.append({"prompt": prompt, "kwargs": kwargs})
++        for piece in self.pieces:
++            yield piece
++
++    def count_tokens(self, text: str) -> int:
++        return self._tokens
++
++    def unload(self) -> None:
++        self.unloaded = True
++
++
++class StepClock:
++    """Monotonic clock that advances a fixed delta on every call."""
++
++    def __init__(self, step: float = 0.01):
++        self.step = step
++        self.t = 0.0
++        self.calls = 0
++
++    def __call__(self) -> float:
++        self.calls += 1
++        value = self.t
++        self.t += self.step
++        return value
++
++
++def make_loader(backends):
++    """Build a load_fn that returns backends keyed by path."""
++    loaded = []
++
++    def load_fn(path, *, use_gpu=False, n_ctx=None):
++        backend = backends[path]
++        if backend.fail_load:
++            raise RuntimeError(f"cannot load {path}")
++        loaded.append(path)
++        profile = types.SimpleNamespace(
++            architecture="llama", quantization="Q4_K_M",
++            param_count_estimate="7B", file_size_gb=4.2,
++        )
++        strategy = types.SimpleNamespace(n_ctx=2048, use_gpu=use_gpu)
++        return backend, profile, strategy
++
++    load_fn.loaded = loaded
++    return load_fn
++
++
++# ── Measurement math ─────────────────────────────────────────────────────
++
++
++class TestMeasurement:
++    def test_ttft_and_tps_are_measured(self):
++        backend = FakeBackend(pieces=("Hello ", "world"), tokens=6)
++        load_fn = make_loader({"/m/a.gguf": backend})
++        clock = StepClock(step=0.01)
++
++        runner = SuiteRunner(load_fn=load_fn, unload_fn=lambda b: b.unload(), clock=clock)
++        run = runner.run(["/m/a.gguf"], prompt_ids=["short"])
++
++        assert run.status == "done"
++        model = run.models[0]
++        assert model.status == "ok"
++        assert len(model.prompts) == 1
++        result = model.prompts[0]
++        # 2 pieces -> ttft = one step (10ms), decode = one step (10ms).
++        assert result.tokens_generated == 6
++        assert result.ttft_ms == pytest.approx(10.0, rel=1e-6)
++        assert result.gen_time_ms == pytest.approx(10.0, rel=1e-6)
++        assert result.tokens_per_second == pytest.approx(600.0, rel=1e-3)
++
++    def test_max_tokens_override_is_passed_through(self):
++        backend = FakeBackend()
++        load_fn = make_loader({"/m/a.gguf": backend})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        runner.run(["/m/a.gguf"], prompt_ids=["short"], max_tokens=32)
++
++        assert backend.calls[0]["kwargs"]["max_tokens"] == 32
++        assert backend.calls[0]["kwargs"]["temperature"] == 0.0
++
++    def test_prompt_cap_used_when_no_override(self):
++        backend = FakeBackend()
++        load_fn = make_loader({"/m/a.gguf": backend})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        runner.run(["/m/a.gguf"], prompt_ids=["short"])
++
++        expected = next(p for p in SUITE_PROMPTS if p.id == "short").max_tokens
++        assert backend.calls[0]["kwargs"]["max_tokens"] == expected
++
++    def test_empty_stream_gives_zero_tps(self):
++        backend = FakeBackend(pieces=(), tokens=0)
++        load_fn = make_loader({"/m/a.gguf": backend})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        run = runner.run(["/m/a.gguf"], prompt_ids=["short"])
++        result = run.models[0].prompts[0]
++        assert result.tokens_generated == 0
++        assert result.tokens_per_second == 0.0
++
++
++# ── Run behaviour ────────────────────────────────────────────────────────
++
++
++class TestRunBehaviour:
++    def test_models_run_in_order_and_all_prompts_execute(self):
++        a, b = FakeBackend(), FakeBackend()
++        load_fn = make_loader({"/m/a.gguf": a, "/m/b.gguf": b})
++
++        runner = SuiteRunner(load_fn=load_fn, unload_fn=lambda x: x.unload(), clock=StepClock())
++        run = runner.run(["/m/a.gguf", "/m/b.gguf"])
++
++        assert load_fn.loaded == ["/m/a.gguf", "/m/b.gguf"]
++        assert [m.name for m in run.models] == ["a", "b"]
++        assert all(len(m.prompts) == len(SUITE_PROMPTS) for m in run.models)
++        assert a.unloaded and b.unloaded
++        assert run.progress == 1.0
++
++    def test_load_failure_is_isolated(self):
++        bad = FakeBackend(fail_load=True)
++        good = FakeBackend()
++        load_fn = make_loader({"/m/bad.gguf": bad, "/m/good.gguf": good})
++
++        runner = SuiteRunner(load_fn=load_fn, unload_fn=lambda x: x.unload(), clock=StepClock())
++        run = runner.run(["/m/bad.gguf", "/m/good.gguf"])
++
++        assert run.status == "done"
++        assert run.models[0].status == "error"
++        assert "cannot load" in (run.models[0].error or "")
++        assert run.models[1].status == "ok"
++        assert run.models[1].avg_tps > 0
++
++    def test_cancel_before_run_marks_all_cancelled(self):
++        load_fn = make_loader({"/m/a.gguf": FakeBackend()})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        runner.cancel()
++        run = runner.run(["/m/a.gguf"])
++        assert run.status == "cancelled"
++        assert run.models[0].status == "cancelled"
++
++    def test_leaderboard_sorted_fastest_first(self):
++        slow = FakeBackend(tokens=1)
++        fast = FakeBackend(tokens=10)
++        load_fn = make_loader({"/m/slow.gguf": slow, "/m/fast.gguf": fast})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        run = runner.run(["/m/slow.gguf", "/m/fast.gguf"])
++
++        board = run.leaderboard()
++        assert [b["rank"] for b in board] == [1, 2]
++        assert board[0]["name"] == "fast"
++        assert board[0]["avg_tps"] >= board[1]["avg_tps"]
++
++    def test_last_run_is_exposed_for_polling(self):
++        load_fn = make_loader({"/m/a.gguf": FakeBackend()})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        assert runner.last_run is None
++        run = runner.run(["/m/a.gguf"])
++        assert runner.last_run is run
++
++    def test_events_are_emitted(self):
++        load_fn = make_loader({"/m/a.gguf": FakeBackend()})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        events = []
++        runner.run(["/m/a.gguf"], on_event=events.append)
++        kinds = [e["type"] for e in events]
++        assert "run_start" in kinds
++        assert "model_start" in kinds
++        assert kinds.count("prompt_done") == len(SUITE_PROMPTS)
++        assert kinds[-1] == "run_done"
++
++    def test_gpu_device_sets_use_gpu(self):
++        seen = {}
++
++        def load_fn(path, *, use_gpu=False, n_ctx=None):
++            seen["use_gpu"] = use_gpu
++            profile = types.SimpleNamespace(architecture="x", quantization="", param_count_estimate="", file_size_gb=0.0)
++            return FakeBackend(), profile, types.SimpleNamespace(n_ctx=1024)
++
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        runner.run(["/m/a.gguf"], device="gpu", prompt_ids=["short"])
++        assert seen["use_gpu"] is True
++
++
++# ── Store + exports ──────────────────────────────────────────────────────
++
++
++class TestStoreAndExports:
++    def _run(self):
++        load_fn = make_loader({"/m/a.gguf": FakeBackend()})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        return runner.run(["/m/a.gguf"])
++
++    def test_store_round_trip(self, tmp_path):
++        run = self._run()
++        store = SuiteStore(tmp_path / "suites")
++        store.save(run)
++
++        assert store.get(run.run_id)["run_id"] == run.run_id
++        listed = store.list()
++        assert listed and listed[0]["run_id"] == run.run_id
++        assert listed[0]["model_count"] == 1
++
++    def test_get_missing_returns_none(self, tmp_path):
++        assert SuiteStore(tmp_path / "suites").get("nope") is None
++
++    def test_export_markdown_has_leaderboard(self):
++        md = export_markdown(self._run())
++        assert "Leaderboard" in md
++        assert "Tokens/sec" in md
++        assert "| a |" in md
++
++    def test_export_csv_has_header_and_rows(self):
++        csv_text = export_csv(self._run())
++        lines = [ln for ln in csv_text.splitlines() if ln.strip()]
++        assert lines[0].startswith("run_id,device,model")
++        assert len(lines) == len(SUITE_PROMPTS) + 1  # header + one row per prompt
++
++    def test_export_markdown_lists_failures(self):
++        bad = FakeBackend(fail_load=True)
++        load_fn = make_loader({"/m/bad.gguf": bad})
++        runner = SuiteRunner(load_fn=load_fn, clock=StepClock())
++        run = runner.run(["/m/bad.gguf"])
++        assert "Failed models" in export_markdown(run)
++
++
++# ── Route wiring ─────────────────────────────────────────────────────────
++
++
++class TestRoutes:
++    def test_suite_routes_registered(self):
++        from ggufloader.api.routes.benchmark import router as bench_router
++
++        paths = {r.path for r in bench_router.routes if hasattr(r, "path")}
++        for expected in (
++            "/suite/prompts",
++            "/suite/models",
++            "/suite/run",
++            "/suite/status",
++            "/suite/cancel",
++            "/suite/runs",
++            "/suite/runs/{run_id}",
++            "/suite/runs/{run_id}/export",
++            "/run",
++        ):
++            assert expected in paths, f"missing route {expected}"
++
++    def test_router_still_has_legacy_routes(self):
++        from ggufloader.api.routes.benchmark import router as bench_router
++
++        paths = {r.path for r in bench_router.routes if hasattr(r, "path")}
++        assert {"/prompts", "/history", "/reports"} <= paths
++
++    def test_suite_prompts_defined(self):
++        assert len(SUITE_PROMPTS) >= 3
++        assert all(isinstance(p, SuitePrompt) for p in SUITE_PROMPTS)
++
++    def test_dataclass_helpers(self):
++        r = PromptResult("short", "Short", 10, 20.0, 30.0, 100.0)
++        assert r.to_dict()["tokens_per_second"] == 100.0
++        m = ModelResult(path="/x/a.gguf", name="a")
++        m.prompts.append(r)
++        assert m.avg_tps == 100.0 and m.total_tokens == 10
++        run = SuiteRun(run_id="r1", models=[m])
++        assert run.to_dict()["models"][0]["name"] == "a"

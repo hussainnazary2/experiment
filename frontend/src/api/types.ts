@@ -1,0 +1,135 @@
+// Model types
+export interface ModelInfo {
+  loaded: boolean
+  path?: string
+  filename?: string
+  family?: string
+  architecture?: string
+  quantization?: string
+  parameters?: string
+  context_length?: number
+  gpu: boolean
+  auto_load?: string
+  auto_load_message?: string | null
+  models_dir?: string | null
+  compatible?: boolean | null
+  compatible_error?: string | null
+}
+
+// App-level identity (GET /api/app/info) — single-model build banner.
+export interface AppInfo {
+  name: string
+  version: string
+  label: string
+  tagline: string
+  pinned: {
+    arch: string
+    quant: string
+    size: string
+  }
+}
+
+export interface MemoryEstimate {
+  ram_gb: number
+  vram_gb: number
+  quantization: string
+  fits_in_vram: boolean
+}
+
+// Sampling parameters
+export interface SamplingParams {
+  temperature: number
+  top_p: number
+  min_p: number
+  top_k: number
+  repeat_penalty: number
+  max_tokens: number
+}
+
+// GPU types
+export interface GpuStatus {
+  gpu_available: boolean
+  status: string
+  cuda_version?: string
+  vram_mb?: number
+}
+
+export interface LoadRequest {
+  path: string
+  use_gpu: boolean
+  n_ctx: number
+  n_gpu_layers: number
+}
+
+// Session types
+export interface SessionInfo {
+  id: string
+  title?: string
+  created: string
+  updated: string
+  mode: string
+  message_count: number
+}
+
+export interface Message {
+  role: 'user' | 'assistant' | 'system' | 'tool'
+  content: string
+  ts?: string
+  thinking_ms?: number
+}
+
+// Agent types
+export interface AgentStatus {
+  running: boolean
+  preset: string
+  model_loaded: boolean
+  workspace?: string
+}
+
+// File types
+export interface FileNode {
+  name: string
+  path: string
+  is_dir: boolean
+  children?: FileNode[]
+}
+
+export interface FileContent {
+  path: string
+  content: string
+  size: number
+}
+
+// WebSocket events
+export interface WSEvent {
+  type: string
+  [key: string]: any
+}
+
+export interface TokenEvent extends WSEvent {
+  type: 'token'
+  content: string
+  message_id: string
+}
+
+export interface ToolCallEvent extends WSEvent {
+  type: 'tool_call'
+  name: string
+  args: Record<string, any>
+  call_id: string
+}
+
+export interface ApprovalEvent extends WSEvent {
+  type: 'approval_needed'
+  call_id: string
+  tool: string
+  risk: string
+}
+
+export interface MessageCompleteEvent extends WSEvent {
+  type: 'message_complete'
+  message_id: string
+  content: string
+  tokens_used: number
+  duration_ms: number
+}
