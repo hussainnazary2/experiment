@@ -9,7 +9,8 @@ const FALLBACK: AppInfo = {
   name: 'GGUF Loader',
   version: '',
   label: 'Gemma 4 12B Q4_K_M',
-  tagline: 'Optimized for Gemma 4 12B Q4_K_M',
+  tagline: 'Your local AI experiment studio — run any GGUF model',
+  universal: true,
   pinned: { arch: 'gemma4', quant: 'Q4_K_M', size: '12B' },
 }
 

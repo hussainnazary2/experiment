@@ -8,6 +8,8 @@ import {
   CheckCircle2,
   AlertCircle,
   RefreshCw,
+  Wrench,
+  Undo2,
 } from 'lucide-react'
 import { modelApi } from '../../api/client'
 import { useModelStore } from '../../stores/modelStore'
@@ -74,6 +76,17 @@ export function ModelPicker({ align = 'top', load, onLoaded, className = '' }: M
   const [open, setOpen] = useState(false)
   const [loadingPath, setLoadingPath] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // What the backend can say about the file that just failed to load: a
+  // metadata problem it can fix in place, an explanation it cannot fix (for
+  // example a tensor-name mismatch), and whether a previous repair is undoable.
+  const [diagnosis, setDiagnosis] = useState<{
+    path: string
+    filename: string
+    fix: string | null
+    explanation: { summary: string; detail: string } | null
+    hasBackup: boolean
+  } | null>(null)
+  const [repairing, setRepairing] = useState(false)
 
   const info = useModelStore((s) => s.info)
   const dl = useDownloadStore((s) => s.dl)
@@ -158,9 +171,35 @@ export function ModelPicker({ align = 'top', load, onLoaded, className = '' }: M
     await scanFolder(path)
   }
 
+  /**
+   * After a failed load: ask the backend to explain the file (read-only).
+   * The load message is passed along because it names what llama.cpp wanted -
+   * e.g. a tensor - which is what makes a tensor check possible.
+   */
+  async function diagnoseModel(model: FolderModel, message: string) {
+    try {
+      const diagnosed = await modelApi.diagnose(model.path, message)
+      const findings = diagnosed?.findings || []
+      const fixable = findings.find((f: any) => f?.repairable)
+      const explained = findings.find((f: any) => !f?.repairable)
+      setDiagnosis({
+        path: model.path,
+        filename: model.filename,
+        fix: fixable ? (fixable.fix || fixable.summary) : null,
+        explanation: !fixable && explained
+          ? { summary: explained.summary, detail: explained.detail }
+          : null,
+        hasBackup: Boolean(diagnosed?.has_header_backup),
+      })
+    } catch {
+      setDiagnosis(null)                    // diagnosis is best-effort
+    }
+  }
+
   async function handleLoad(model: FolderModel) {
     setLoadingPath(model.path)
     setError(null)
+    setDiagnosis(null)
     try {
       if (load) {
         await load(model.path)
@@ -176,8 +215,54 @@ export function ModelPicker({ align = 'top', load, onLoaded, className = '' }: M
       const message = e?.message || `Failed to load ${model.filename}`
       setError(message)
       toast.error(message)
+      void diagnoseModel(model, message)
     }
     setLoadingPath(null)
+  }
+
+  /**
+   * Repair the file's metadata in place, then retry the load. Tensor data is
+   * never rewritten (the header is adjusted and verified server-side), which
+   * is why this is safe to offer for a multi-GB model.
+   */
+  async function handleRepair() {
+    if (!diagnosis) return
+    const target = models.find((m) => m.path === diagnosis.path)
+    setRepairing(true)
+    try {
+      const result = await modelApi.repair(diagnosis.path, true)
+      if (!result?.applied) {
+        setError(result?.message || 'The metadata could not be repaired')
+        return
+      }
+      toast.success(result.message || 'Metadata repaired')
+      setDiagnosis(null)
+      if (target) await handleLoad(target)
+    } catch (e: any) {
+      setError(e?.message || 'Repair failed')
+    } finally {
+      setRepairing(false)
+    }
+  }
+
+  /**
+   * Put the file back exactly as it was before the metadata repair. Offered
+   * whenever the backup is still beside the model, because a repair that did
+   * not fix the load (the file failed on something else) should not leave the
+   * user's multi-GB file modified without them knowing.
+   */
+  async function handleUndoRepair() {
+    if (!diagnosis) return
+    setRepairing(true)
+    try {
+      const result = await modelApi.undoRepair(diagnosis.path)
+      toast.success(result?.message || 'Original header restored')
+      setDiagnosis(null)
+    } catch (e: any) {
+      setError(e?.message || 'Undo failed')
+    } finally {
+      setRepairing(false)
+    }
   }
 
   const loadedName = info.loaded ? info.filename : ''
@@ -353,6 +438,56 @@ export function ModelPicker({ align = 'top', load, onLoaded, className = '' }: M
                   <AlertCircle size={11} className="flex-shrink-0 mt-0.5" />
                   <span className="break-words">{error}</span>
                 </div>
+              </div>
+            )}
+
+            {/* What the backend can say about the file that just failed. */}
+            {diagnosis && (
+              <div className="border-t border-border px-3 py-2 space-y-1.5">
+                {diagnosis.fix && (
+                  <>
+                    <p className="text-[10px] text-text-muted leading-snug">
+                      <span className="text-text-sec font-medium">{diagnosis.filename}</span> has a
+                      metadata problem llama.cpp refuses: {diagnosis.fix}.
+                    </p>
+                    <button
+                      onClick={() => void handleRepair()}
+                      disabled={repairing}
+                      className="w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-accent/10 border border-accent/25 rounded-lg text-[11px] font-medium text-accent hover:bg-accent/20 disabled:opacity-50 transition-colors"
+                    >
+                      {repairing
+                        ? <Loader2 size={11} className="animate-spin" />
+                        : <Wrench size={11} />}
+                      Repair metadata &amp; load
+                    </button>
+                    <p className="text-[9.5px] text-text-muted leading-snug">
+                      Rewrites the header only - the file keeps its size and the model weights are
+                      never touched. The original header is saved next to the model.
+                    </p>
+                  </>
+                )}
+
+                {diagnosis.explanation && (
+                  <div className="space-y-1">
+                    <div className="flex items-start gap-1.5 text-[10px] text-amber-400 leading-snug">
+                      <AlertCircle size={11} className="flex-shrink-0 mt-0.5" />
+                      <span>{diagnosis.explanation.summary}</span>
+                    </div>
+                    <p className="text-[9.5px] text-text-muted leading-snug">
+                      {diagnosis.explanation.detail}
+                    </p>
+                  </div>
+                )}
+
+                {diagnosis.hasBackup && (
+                  <button
+                    onClick={() => void handleUndoRepair()}
+                    disabled={repairing}
+                    className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 bg-elevated border border-border rounded-lg text-[10.5px] text-text-sec hover:border-accent disabled:opacity-50 transition-colors"
+                  >
+                    <Undo2 size={11} /> Undo metadata repair
+                  </button>
+                )}
               </div>
             )}
           </div>

@@ -18,16 +18,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from ggufloader.api.routes import agent, chat, files, files_render, gpu, model, session, mcp, tools, workflows, plugins, templates, branching, workspaces, search, benchmark, sandbox, playground
+from ggufloader.api.routes import agent, chat, files, files_render, gpu, model, session, mcp, tools, workflows, plugins, templates, branching, workspaces, search, benchmark, sandbox, playground, hf
 from ggufloader.api.websocket.handler import websocket_endpoint
 from ggufloader._version import __version__
 from ggufloader.config import (
     APP_NAME,
     PINNED_ARCH,
     PINNED_MODEL_LABEL,
+    PINNED_ONLY,
     PINNED_QUANT,
     PINNED_SIZE,
     PINNED_TAGLINE,
+    UNIVERSAL_TAGLINE,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,9 +59,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Active workspace: %s (%s)", active.name, active.path)
     except Exception as e:
         logger.warning("Failed to set active workspace: %s", e)
-    # Background scan + load of the pinned Gemma 4 12B Q4_K_M GGUF from the
-    # models folder (start_auto_load spawns a daemon thread and returns
-    # immediately; it is a no-op under pytest / GGUFLOADER_SKIP_AUTOLOAD).
+    # Background scan + load of the best available GGUF from the models
+    # folder (starter model preferred, any other GGUF otherwise). start_auto_load
+    # spawns a daemon thread and returns immediately; it is a no-op under
+    # pytest / GGUFLOADER_SKIP_AUTOLOAD.
     from ggufloader.api.auto_load import start_auto_load
     try:
         status = start_auto_load()
@@ -111,6 +114,7 @@ def create_app() -> FastAPI:
     app.include_router(benchmark.router, prefix="/api/benchmark", tags=["benchmark"])
     app.include_router(playground.router, prefix="/api/playground", tags=["playground"])
     app.include_router(sandbox.router, prefix="/api/sandbox", tags=["sandbox"])
+    app.include_router(hf.router, prefix="/api/hf", tags=["huggingface"])
 
     # WebSocket endpoint
     app.websocket("/ws")(websocket_endpoint)
@@ -147,15 +151,18 @@ def create_app() -> FastAPI:
             threading.Timer(3.0, os._exit, args=(0,)).start()
         return {"status": "shutting_down"}
 
-    # App-level identity: drives the version banner and the
-    # first-launch model-compatibility dialog in the React UI.
+    # App-level identity: drives the version banner and the first-launch
+    # compatibility dialog in the React UI. In universal mode (default) the
+    # tagline advertises any-GGUF loading and `pinned` merely describes the
+    # recommended starter model offered as a one-click download.
     @app.get("/api/app/info")
     async def app_info():
         return {
             "name": APP_NAME,
             "version": __version__,
             "label": PINNED_MODEL_LABEL,
-            "tagline": PINNED_TAGLINE,
+            "tagline": PINNED_TAGLINE if PINNED_ONLY else UNIVERSAL_TAGLINE,
+            "universal": not PINNED_ONLY,
             "pinned": {
                 "arch": PINNED_ARCH,
                 "quant": PINNED_QUANT,

@@ -1,5 +1,93 @@
 # Changelog
 
+## [2.4.2] - 2026-10-17
+
+### Chat-tab model loading fixed (deadlock + hardening)
+
+The Chatbot tab could appear completely broken while the Agent tab worked:
+sending a message deadlocked the stream and every later model operation
+(including loading) hung forever. All fixed and verified end-to-end with a
+real model (TinyLlama Q2_K) in a live browser.
+
+### Fixed
+- **Chat-stream deadlock (root cause)** — `ModelBackend` used a plain
+  `threading.Lock`, but `chat_stream` holds it for the whole stream while
+  the playground's live `stats` events call `count_tokens` from the same
+  thread mid-stream → non-reentrant re-acquire → deadlock. The stream froze
+  after ~0.25s and, because the lock never released, every subsequent model
+  load hung too ("model loading doesn't work at all" in chat mode). Now an
+  `RLock`: same-thread reentrancy works, cross-thread serialization is kept.
+- **Chatbot tab only scanned the default models folder** — if your GGUFs
+  lived elsewhere (the folder you browsed in the agent picker), the chat
+  dropdown showed "No GGUF models found" with no way to browse. The chat
+  model bar now remembers the same `ggufloader_model_folder` as the agent
+  picker and has its own folder Browse button.
+- `/api/playground/model` always reported `architecture`/`quantization` as
+  null (ModelBackend never carried them) — now filled from the router's
+  cached metadata inspect, so the chat model chip shows real badges.
+
+### Changed (model lifecycle hardening)
+- **Deterministic unload** — `ModelBackend.unload()` now calls
+  `Llama.close()` + `gc.collect()` at a controlled point instead of leaving
+  the C-level free to a random GC pass (which could fire inside the next
+  `Llama()` construction and segfault the server).
+- **Global model lifecycle lock** (`deps.model_lifecycle_lock`) serializes
+  every load/swap/unload across threads: `/api/model/load`,
+  `/api/playground/model/load`, `/api/model/unload`, and the startup
+  auto-load worker all swap under it, so two `Llama()` constructors can
+  never race.
+- `/api/model/load` (agent path) now unloads the previous model explicitly
+  before constructing the new one (it used to orphan the old Llama — a
+  leak plus a random-crash risk). `/api/model/unload` really frees memory
+  now and resets the auto-load state.
+- Playground loads default to the router's GPU auto-detection instead of
+  forcing CPU (`use_gpu: null` = auto, explicit true/false still honored).
+
+## [2.4.1] - 2026-10-16
+
+### Universal Model Loader — your local AI experiment studio
+
+The single-model restriction is gone: **any GGUF model loads**, with
+per-family settings, an in-app HuggingFace browser, a multi-model Testing
+Studio, and a live hardware HUD built for recording and sharing.
+
+### Added
+- **Universal model loading** — `ggufloader/config/model_families.json` ships
+  9 family profiles (gemma4/gemma3, llama, qwen, mistral, phi, deepseek,
+  tinyllama, smollm) with per-family sampling from each model card. The load
+  gate is now informational (`PINNED_ONLY = False` by default; set it True to
+  restore the v2.3 single-model contract). Auto-load prefers the starter
+  model, else loads the newest loadable GGUF. Per-family agent profiles scale
+  context/token/step budgets (deepseek gets 16K ctx, tiny models get 4K).
+- **HuggingFace model browser** (`/api/hf/*` + Models panel) — search GGUF
+  repos (trending by default), expand a repo for per-file sizes + quant
+  badges with quality/speed hints, download with live progress + speed +
+  resume, then Load straight into the app. Fixed the HF Hub API change that
+  silently returned zero models (search now requests `expand[]=siblings`).
+- **Testing Studio wired** — the `testingApi` client was added (the panel
+  existed but could not compile without it) and the panel is registered:
+  speed-race multiple models on CPU/GPU with a live leaderboard, real
+  TTFT/tok-s, screen recording with stats HUD, and JSON/MD/CSV exports.
+- **Live hardware telemetry** — `GET /api/gpu/live` (RAM, CPU, process RSS,
+  nvidia-smi GPU util/VRAM/temp with graceful fallbacks) drives a floating
+  **Hardware HUD** (bottom-left) that stays visible in recordings.
+- **REC button in the chatbot** — one-click screen capture with a live stats
+  overlay burned into the frame: model name, tok/s, tokens, TTFT, RAM/CPU/GPU,
+  "100% local". Ready for Instagram Reels / YouTube Shorts.
+- HF downloads keep their `.part` file on error so interrupted multi-GB
+  downloads resume; finishing a download auto-loads the model when nothing
+  else is loaded.
+
+### Changed
+- First-launch dialog now guides to the HuggingFace browser ("Get a model")
+  instead of rejecting non-Gemma models.
+- Version banner / load dialog / message input copy updated for universal
+  mode; the pinned model is presented as the *recommended starter*.
+- `detect_family`: longest name-pattern wins (tinyllama no longer matches the
+  llama family; deepseek distills resolve to deepseek, not qwen).
+- `services/__init__.py` guards the legacy PySide6 imports so server-only
+  environments work without Qt.
+
 ## [2.4.0] - 2026-10-16
 
 ### Local model speed chatbot
@@ -27,35 +115,6 @@ prefer.
 
 ### Changed
 - The center column defaults to the chatbot; the agent view is behind a toggle.
-- **One model picker for both views** (`frontend/src/components/model/ModelPicker.tsx`):
-  the chatbot now selects models exactly like agent mode - browse a folder of
-  GGUFs, see family / quantization / size, click one to load it. The picker
-  lives in the prompt row in both views, and defaults to the app's models
-  folder when none has been chosen yet.
-- **Token readouts sit directly above the prompt box** in the chatbot and
-  gained the counts that were missing: **prompt tokens**, **total tokens**
-  (prompt + generated) and the running **session total**.
-
-### Fixed
-- **Any GGUF loads again.** `POST /api/model/load` no longer rejects every
-  model that is not the pinned Gemma 4 12B Q4_K_M with HTTP 400. The pinned
-  model is the tuned default (reported as `compatible` in `/api/model/info`),
-  not a gate. The frontend also stopped swallowing load failures, so a
-  rejected load now shows the reason instead of looking like nothing happened.
-- **Startup auto-load falls back to the newest GGUF of any architecture** when
-  no pinned model is on disk, so the app still opens with a working model.
-- **`ggufloader/config/model_families.json` is in the repo again.** The
-  unanchored `config/` ignore rule excluded that tracked package directory, so
-  the documented single source of family params + system prompt was missing
-  from every clone (and `test_gemma4_degeneration` failed). The rule is now
-  `/config/` and the file ships via package-data.
-- Non-gemma4 families get a model-agnostic agent system prompt, so agent mode
-  no longer raises "No system prompt provided by the model router" for Qwen,
-  LFM and other GGUFs.
-- The model catalog reports `quantization` and `context_length` again -
-  `quick_profile` omitted both, so the model lists showed a blank quant column.
-- `tsc -b` succeeds: `frontend/src/api/client.ts` now exports the `testingApi`
-  that `TestingStudioPanel` imports.
 
 ### Removed
 - In-app screen recording: the `useScreenRecorder` hook, the recording HUD and

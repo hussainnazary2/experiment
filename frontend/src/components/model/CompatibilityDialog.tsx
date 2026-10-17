@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  AlertTriangle, CheckCircle2, Loader2, Sparkles, X,
+  AlertTriangle, CheckCircle2, Loader2, Sparkles, X, Globe,
 } from 'lucide-react'
 import { appApi, modelApi } from '../../api/client'
 import type { AppInfo, ModelInfo } from '../../api/types'
+import { useUIStore } from '../../stores/uiStore'
 
 const DONE_KEY = 'ggufloader_compat_check_done'
 const POLL_MS = 1200
@@ -13,21 +14,22 @@ const FALLBACK_APP: AppInfo = {
   name: 'GGUF Loader',
   version: '',
   label: 'Gemma 4 12B Q4_K_M',
-  tagline: 'Optimized for Gemma 4 12B Q4_K_M',
+  tagline: 'Your local AI experiment studio — run any GGUF model',
+  universal: true,
   pinned: { arch: 'gemma4', quant: 'Q4_K_M', size: '12B' },
 }
 
 type Status = 'checking' | 'ready' | 'missing'
 
 /**
- * First-launch model-compatibility check.
+ * First-launch model check.
  *
- * Shows once per install (localStorage flag) and reports which model the
- * startup auto-loader found. While it is still scanning/loading it polls
- * /api/model/info, then presents either a green "ready" card or guidance
- * on where to place a GGUF. Any explicit dismissal marks the check done,
- * and any loaded model counts as ready — the pinned Gemma 4 12B Q4_K_M is
- * the tuned target, not a requirement.
+ * Shows once per install (localStorage flag). While the startup
+ * auto-loader is still scanning/loading it polls /api/model/info, then
+ * either stays silent (a model is ready) or shows guidance: where the
+ * models folder is, and a shortcut into the HuggingFace browser. In
+ * universal mode ANY GGUF works — nothing is rejected. Any explicit
+ * dismissal marks the check as done.
  */
 export function CompatibilityDialog() {
   const [open, setOpen] = useState(false)
@@ -36,6 +38,13 @@ export function CompatibilityDialog() {
   const [app, setApp] = useState<AppInfo>(FALLBACK_APP)
   const [phase, setPhase] = useState<string | undefined>()
   const mounted = useRef(true)
+  const { setRightPanelTab, toggleRightPanel, rightPanelOpen } = useUIStore()
+
+  const openModelBrowser = () => {
+    setRightPanelTab('hfbrowser')
+    if (!rightPanelOpen) toggleRightPanel()
+    markDone()
+  }
 
   const markDone = useCallback(() => {
     try { localStorage.setItem(DONE_KEY, '1') } catch { /* ignore */ }
@@ -46,9 +55,8 @@ export function CompatibilityDialog() {
     if (!mounted.current) return
     setInfo(i)
     if (i.loaded) {
-      // Any loaded model is fine - the pinned Gemma 4 12B Q4_K_M is the
-      // tuned target, not a requirement. Mark done and never surface the
-      // dialog on the happy path.
+      // Universal mode: any loaded model is good. Mark done and never
+      // surface the dialog on the happy path.
       try { localStorage.setItem(DONE_KEY, '1') } catch { /* ignore */ }
       setStatus('ready')
       setOpen(false)
@@ -99,8 +107,8 @@ export function CompatibilityDialog() {
     }
     let alive = true
     ;(async () => {
-      // Fast path: the model is already loaded & compatible at mount, so
-      // the check has nothing to report — acknowledge silently, no flash.
+      // Fast path: a model is already loaded at mount, so the check has
+      // nothing to report — acknowledge silently, no flash.
       let pre: ModelInfo | null = null
       try { pre = await modelApi.info() } catch { /* offline */ }
       if (!alive) return
@@ -109,8 +117,7 @@ export function CompatibilityDialog() {
         mounted.current = false
         return
       }
-      // Something needs attention (missing / incompatible / still loading) —
-      // show the dialog and poll until it settles.
+      // No model yet — show the dialog and poll until it settles.
       setOpen(true)
       await runCheck()
     })()
@@ -163,11 +170,9 @@ export function CompatibilityDialog() {
                 <p className="text-sm font-medium text-text">Model ready</p>
                 <p className="text-xs text-text-sec leading-relaxed">
                   {info?.filename
-                    ? <><span className="font-mono text-text">{info.filename}</span> is loaded
-                      {info.compatible === false
-                        ? ' — not the tuned target, so sampling and prompts come from the generic profile.'
-                        : ' and matches the tuned target.'}</>
-                    : 'A model is loaded.'}
+                    ? <><span className="font-mono text-text">{info.filename}</span> is loaded and ready.</>
+                    : 'A model is loaded and ready.'}{' '}
+                  {app.universal !== false && 'Any GGUF you drop in the models folder works, too.'}
                 </p>
               </div>
             </div>
@@ -177,23 +182,26 @@ export function CompatibilityDialog() {
             <div className="flex items-start gap-3">
               <AlertTriangle size={20} className="text-amber-400 mt-0.5 shrink-0" />
               <div className="space-y-2 flex-1">
-                <p className="text-sm font-medium text-text">Model needed</p>
+                <p className="text-sm font-medium text-text">Get a model</p>
                 <p className="text-xs text-text-sec leading-relaxed">
-                  No model is loaded yet. This build is tuned for{' '}
-                  <span className="text-text">{app.label}</span> (Q4_K_M) — pick a model
-                  from the model picker, or drop a GGUF in the folder below.
+                  {app.name} runs any GGUF model locally — nothing leaves your machine. Download one
+                  straight from HuggingFace below, or drop a <span className="font-mono">.gguf</span> file
+                  into the models folder and it loads automatically.
                 </p>
                 {info?.auto_load_message && (
                   <p className="text-xs text-amber-300/90 leading-relaxed">
                     {info.auto_load_message}
                   </p>
                 )}
+                <button
+                  onClick={openModelBrowser}
+                  className="flex items-center gap-2 w-full text-xs font-medium px-4 py-2.5 rounded-lg bg-accent/15 text-accent hover:bg-accent/25 transition-colors"
+                >
+                  <Globe size={14} /> Browse HuggingFace models
+                </button>
                 {info?.models_dir && (
                   <div className="space-y-1">
-                    <p className="text-[11px] text-text-muted">
-                      Place a <span className="font-mono">.gguf</span> here — any model is
-                      detected and loaded automatically at startup:
-                    </p>
+                    <p className="text-[11px] text-text-muted">…or place your GGUF here:</p>
                     <div className="px-3 py-2 bg-elevated border border-border rounded-lg font-mono text-[11px] text-accent break-all">
                       {info.models_dir}
                     </div>

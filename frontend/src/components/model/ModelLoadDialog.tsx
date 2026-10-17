@@ -13,10 +13,19 @@ interface Props {
 }
 
 const RECENT_MODELS_KEY = 'ggufloader_recent_models'
+const USE_GPU_KEY = 'ggufloader_use_gpu'
 
 export function ModelLoadDialog({ onClose, onLoaded }: Props) {
   const [modelPath, setModelPath] = useState('')
-  const [useGpu, setUseGpu] = useState(true)
+  // Device default follows the app-wide CPU/GPU preference (CPU default,
+  // shared with the Chatbot tab's toggle) so both tabs load on the same
+  // device without flipping two switches.
+  const [useGpu, setUseGpu] = useState(() => {
+    try {
+      const v = localStorage.getItem(USE_GPU_KEY)
+      return v === null ? false : v === '1'
+    } catch { return false }
+  })
   const [gpuLayers, setGpuLayers] = useState(-1)
   const [ctxLength, setCtxLength] = useState(0) // 0 = Auto (router decides)
   const [plan, setPlan] = useState<any>(null)
@@ -26,7 +35,7 @@ export function ModelLoadDialog({ onClose, onLoaded }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [currentModel, setCurrentModel] = useState<ModelInfo | null>(null)
   const [recentModels, setRecentModels] = useState<string[]>([])
-  const [compat, setCompat] = useState<{ ok: boolean; label?: string } | null>(null)
+  const [compat, setCompat] = useState<{ ok: boolean; starter: boolean; label: string; family: string; detail: string } | null>(null)
   const [compatLoading, setCompatLoading] = useState(false)
 
   // Load current model info + recent models
@@ -38,8 +47,9 @@ export function ModelLoadDialog({ onClose, onLoaded }: Props) {
     } catch {}
   }, [])
 
-  // Pinned-target compatibility check (mirrors the backend load gate):
-  // only Gemma 4 12B Q4_K_M passes.
+  // Family + compatibility info from the backend's own detector (the
+  // same verdict the load gate would apply). In universal mode this is
+  // informational: unknown families still load with generic defaults.
   const fetchCompat = useCallback(async (path: string) => {
     if (!path || !path.endsWith('.gguf')) { setCompat(null); return }
     setCompatLoading(true)
@@ -48,10 +58,15 @@ export function ModelLoadDialog({ onClose, onLoaded }: Props) {
       const arch = (p.architecture || '').toLowerCase()
       const quantBlob = `${p.quantization || ''} ${p.filename || ''}`.toUpperCase()
       const sizeBlob = `${p.param_estimate || ''} ${p.filename || ''}`.toUpperCase()
-      const ok = arch === 'gemma4' && quantBlob.includes('Q4_K_M') && sizeBlob.includes('12B')
-      setCompat(ok
-        ? { ok: true, label: p.filename || 'Gemma 4 12B Q4_K_M' }
-        : { ok: false, label: `${p.architecture || 'unknown'} · ${p.quantization || 'unknown'} · ${p.param_estimate || 'unknown'}` })
+      const isStarter = arch === 'gemma4' && quantBlob.includes('Q4_K_M') && sizeBlob.includes('12B')
+      const family = p.family || arch || 'generic'
+      setCompat({
+        ok: true, // universal mode: any GGUF loads
+        starter: isStarter,
+        label: p.filename || 'model',
+        family,
+        detail: `${p.architecture || 'unknown'} · ${p.quantization || 'unknown'} · ${p.param_estimate || 'unknown'}`,
+      })
     } catch { setCompat(null) }
     setCompatLoading(false)
   }, [])
@@ -207,34 +222,35 @@ export function ModelLoadDialog({ onClose, onLoaded }: Props) {
             </div>
           )}
 
-          {/* Pinned-model compatibility verdict */}
+          {/* Model family verdict (any GGUF loads; starter badge is informational) */}
           {(compatLoading || compat) && modelPath.endsWith('.gguf') && (
             <div className={`flex items-start gap-2 px-3 py-2 rounded-lg border ${
               compatLoading
                 ? 'bg-elevated/50 border-border'
-                : compat?.ok
+                : compat?.starter
                   ? 'bg-green-500/10 border-green-500/20'
-                  : 'bg-amber-500/10 border-amber-500/20'
+                  : 'bg-accent/10 border-accent/20'
             }`}>
               {compatLoading ? (
                 <Loader2 size={14} className="animate-spin text-text-muted mt-0.5 shrink-0" />
-              ) : compat?.ok ? (
+              ) : compat?.starter ? (
                 <CheckCircle2 size={14} className="text-green-400 mt-0.5 shrink-0" />
               ) : (
-                <AlertTriangle size={14} className="text-amber-400 mt-0.5 shrink-0" />
+                <Sparkles size={14} className="text-accent mt-0.5 shrink-0" />
               )}
               <div className="text-xs leading-relaxed">
                 {compatLoading ? (
-                  <span className="text-text-muted">Checking compatibility...</span>
-                ) : compat?.ok ? (
+                  <span className="text-text-muted">Reading model metadata…</span>
+                ) : compat?.starter ? (
                   <span className="text-text">
-                    <span className="text-green-400 font-medium">Compatible</span> —{' '}
-                    <span className="font-mono">{compat.label}</span> matches the pinned Gemma 4 12B Q4_K_M target.
+                    <span className="text-green-400 font-medium">Recommended starter</span> —{' '}
+                    <span className="font-mono">{compat.label}</span> (Gemma 4 12B Q4_K_M).
                   </span>
                 ) : (
                   <span className="text-text">
-                    <span className="text-amber-400 font-medium">Not the pinned model</span> —{' '}
-                    <span className="font-mono">{compat?.label}</span>. This build only runs Gemma 4 12B Q4_K_M.
+                    <span className="text-accent font-medium capitalize">{compat?.family} model</span> —{' '}
+                    <span className="font-mono">{compat?.detail}</span>. Loads with per-family settings;
+                    unknown families use safe defaults.
                   </span>
                 )}
               </div>
@@ -248,7 +264,10 @@ export function ModelLoadDialog({ onClose, onLoaded }: Props) {
                 <Cpu size={14} className="text-accent" />
                 <span className="text-sm text-text">GPU Offload</span>
               </div>
-              <button onClick={() => setUseGpu(!useGpu)}
+              <button onClick={() => {
+                setUseGpu(!useGpu)
+                try { localStorage.setItem(USE_GPU_KEY, !useGpu ? '1' : '0') } catch {}
+              }}
                 className={`relative w-9 h-5 rounded-full transition-colors ${useGpu ? 'bg-accent' : 'bg-border'}`}>
                 <div className="absolute top-0.5 w-4 h-4 bg-white rounded-full transition-transform"
                   style={{ left: useGpu ? '18px' : '2px' }} />

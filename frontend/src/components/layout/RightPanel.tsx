@@ -21,19 +21,21 @@ import { BenchmarkPanel } from '../agent/BenchmarkPanel'
 import { BenchmarkChartPanel } from '../agent/BenchmarkChartPanel'
 import { CollabPanel } from '../agent/CollabPanel'
 import { PluginSandboxPanel } from '../agent/PluginSandboxPanel'
+import { TestingStudioPanel } from '../agent/TestingStudioPanel'
+import { HFBrowserPanel } from '../model/HFBrowserPanel'
 import { ArtifactsSection } from '../chat/ArtifactsSection'
 import { ContextSection } from '../chat/ContextSection'
 import {
   FileText, Settings, RotateCcw, LayoutDashboard, Activity, Brain, Sliders, GitCompare,
   Puzzle, Copy, FileCode, BarChart3, ArrowDownToLine, Search, FolderOpen, GitBranch,
-  Zap, Users, LineChart, Shield,
+  Zap, Users, LineChart, Shield, Globe, FlaskConical,
 } from 'lucide-react'
 
 // Map icon names to actual components
 const ICON_MAP: Record<string, typeof FileText> = {
   FileText, Settings, RotateCcw, LayoutDashboard, Activity, Brain, Sliders, GitCompare,
   Puzzle, Copy, FileCode, BarChart3, ArrowDownToLine, Search, FolderOpen, GitBranch,
-  Zap, Users, LineChart, Shield,
+  Zap, Users, LineChart, Shield, Globe, FlaskConical,
 }
 
 // Map plugin IDs to components
@@ -42,6 +44,8 @@ const COMPONENT_MAP: Record<string, React.ComponentType<any>> = {
   dashboard: WorkspaceDashboard,
   config: AgentConfigPanel,
   settings: SettingsDialog,
+  hfbrowser: HFBrowserPanel,
+  testing: TestingStudioPanel,
   templates: TemplatePanel,
   diff: DiffViewerPanel,
   analytics: AnalyticsDashboard,

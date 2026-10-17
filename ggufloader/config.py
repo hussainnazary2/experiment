@@ -26,11 +26,14 @@ CHAT_MIN_P = 0.0
 CHAT_REPEAT_PENALTY = 1.05
 
 
-# --- Pinned single-model build identity ---
-# This build is optimized for exactly one model (Gemma 4 12B Q4_K_M).
-# Shown in the app-level version banner and the first-launch compatibility
-# dialog; the load gate rejects any other GGUF (see api/routes/model.py).
-APP_NAME = "GGUF Loader"
+# --- Model loading mode ---
+# Universal mode (default): ANY GGUF model can be loaded; the constants
+# below describe the RECOMMENDED starter model offered as a one-click
+# download when the models folder is empty. Set PINNED_ONLY = True to
+# restore the v2.3 single-model gate (load endpoint then rejects any GGUF
+# that is not the pinned target; see api/routes/model.py).
+PINNED_ONLY = False
+UNIVERSAL_TAGLINE = "Your local AI experiment studio — run any GGUF model"
 PINNED_MODEL_LABEL = "Gemma 4 12B Q4_K_M"
 PINNED_TAGLINE = "Optimized for Gemma 4 12B Q4_K_M"
 PINNED_ARCH = "gemma4"
@@ -43,6 +46,9 @@ PINNED_MODEL_URL = (
     "https://huggingface.co/bartowski/gemma-4-12B-it-GGUF/resolve/main/"
     + PINNED_MODEL_FILENAME
 )
+
+# Families shipped for universal detection (ggufloader/config/model_families.json)
+APP_NAME = "GGUF Loader"
 
 
 # Style Constants

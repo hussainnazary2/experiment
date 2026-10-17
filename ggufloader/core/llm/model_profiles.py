@@ -244,6 +244,11 @@ def _load_family_profiles() -> List[Dict[str, Any]]:
                 "supports_system_prompt": fam.get("supports_system_prompt", True),
                 "system_prompt": fam.get("system_prompt", ""),
                 "task_prompts": fam.get("task_prompts", {}),
+                # llama-cpp-python chat format used when the GGUF carries no
+                # embedded tokenizer.chat_template (see ModelBackend.load).
+                # Empty string = "let llama-cpp-python decide" (embedded
+                # template when present, else its llama-2 fallback).
+                "chat_format": fam.get("chat_format", ""),
                 "temperature": params.get("temperature", 0.7),
                 "top_k": params.get("top_k", 40),
                 "top_p": params.get("top_p", 0.9),
@@ -295,11 +300,6 @@ FAMILY_PROFILES = _load_family_profiles()
 
 # Applied when nothing matches: conservative defaults that behave well on
 # most small instruct quants (see the LFM2.5 degeneration incident).
-#
-# It carries a system prompt on purpose. PromptBuilder refuses to run the
-# agent without a router-provided prompt, so a family without one makes
-# agent mode fail outright - previously every non-gemma4 GGUF (Qwen, LFM,
-# anything else) hit that wall.
 GENERIC_PROFILE = {
     "family": "generic",
     "label": "Generic instruct",
@@ -312,32 +312,16 @@ GENERIC_PROFILE = {
     "repeat_penalty": 1.05,
     "min_p": 0.0,
     "max_tokens": 4096,
-    "system_prompt": (
-        "You are a helpful file assistant. You read files, search the "
-        "workspace, run commands, and help users understand and modify "
-        "their project.\n\n"
-        "Respond with ONLY a JSON object (no markdown):\n"
-        '{"reasoning": "what you plan to do", "estimated_steps": 3, '
-        '"tool_calls": [{"tool": "tool_name", "parameters": {}}], "answer": ""}\n\n'
-        "When answering:\n"
-        '{"reasoning": "summary", "estimated_steps": 0, "tool_calls": [], '
-        '"answer": "your answer"}\n\n'
-        "Rules: tool_calls and answer are mutually exclusive. Think step by "
-        "step, keep reasoning concise, and always finish with either the "
-        "tool call you need or the final answer. Never repeat yourself: do "
-        "not re-issue the same tool call, the same parameters, or the same "
-        "sentence. Once the task is done, stop."
-    ),
 }
 
 
 def detect_family(metadata: Dict[str, str], model_path: str | Path) -> Tuple[Dict[str, Any], str]:
     """Return ``(profile, how_detected)`` for the given model.
 
-    Gemma 4 files (GGUF arch ``gemma4`` or a gemma-4/gemma4 name) resolve
-    to the pinned, tuned profile; everything else falls through to the
-    conservative generic profile, which is loadable in its own right
-    (generic sampling + a model-agnostic agent prompt).
+    Single-model app: only the ``gemma4`` family exists. Gemma 4 files
+    (GGUF arch ``gemma4`` or a gemma-4/gemma4 name) resolve to the pinned
+    profile; everything else falls through to the conservative generic
+    profile and is rejected at the model load gate.
     """
     arch = (metadata.get("architecture") or "").lower()
     name = (
@@ -386,11 +370,17 @@ def detect_family(metadata: Dict[str, str], model_path: str | Path) -> Tuple[Dic
         if best_arch is not None:
             return best_arch, f"gguf arch '{arch}'"
 
-    # 2. Try filename/name match
+    # 2. Try filename/name match - longest pattern wins so "tinyllama"
+    # is not swallowed by the "llama" family and "deepseek-r1-distill-qwen"
+    # resolves to deepseek rather than qwen.
+    best_name = None
+    best_name_len = -1
     for prof in FAMILY_PROFILES:
-        names = prof.get("names", ())
-        if any(n and n.lower() in name for n in names):
-            return prof, "filename match"
+        for n in prof.get("names", ()):
+            if n and n.lower() in name and len(n) > best_name_len:
+                best_name_len, best_name = len(n), prof
+    if best_name is not None:
+        return best_name, "filename match"
     # 3. Fallback
     return GENERIC_PROFILE, "generic-fallback"
 

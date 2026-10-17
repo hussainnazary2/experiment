@@ -13,10 +13,16 @@ from pydantic import BaseModel
 from ggufloader.api.auto_load import (
     auto_load_status,
     pinned_download_status,
-    remember_model_dir,
+    reset_auto_load,
     start_pinned_download,
 )
-from ggufloader.api.deps import get_model_backend, set_model_backend, get_router
+from ggufloader.api.deps import (
+    get_model_backend,
+    model_lifecycle_lock,
+    set_model_backend,
+    get_router,
+)
+from ggufloader.config import PINNED_ONLY
 from ggufloader.core.llm.model_profiles import resolve_chat_config, read_gguf_general_metadata
 from ggufloader.core.router import ModelRole
 
@@ -51,8 +57,8 @@ class ModelInfo(BaseModel):
     auto_load: Optional[str] = None
     auto_load_message: Optional[str] = None
     models_dir: Optional[str] = None
-    # Is the loaded model the tuned pinned target? False means it runs with
-    # generic sampling/prompts (advisory only - loading is never blocked);
+    # Pinned-target compatibility of the currently loaded model. False when
+    # a model somehow got loaded despite the gate (e.g. older session state);
     # None when nothing is loaded.
     compatible: Optional[bool] = None
     compatible_error: Optional[str] = None
@@ -64,32 +70,41 @@ PINNED_ARCH = "gemma4"
 def pinned_target_error(profile) -> Optional[str]:
     """Return a human message if profile is NOT the pinned target, else None.
 
-    ADVISORY ONLY. The pinned Gemma 4 12B Q4_K_M stays the recommended
-    model (best sampling/prompt tuning), but any GGUF can be loaded now:
-    this verdict feeds the ``compatible`` field in /model/info so the UI
-    can nudge the user, and it is used by the startup auto-loader to
-    prefer the pinned model when one is on disk. Nothing rejects a load.
+    In universal mode (PINNED_ONLY = False, the default) this is purely
+    informational: the verdict surfaces through ``/api/model/info`` as
+    ``compatible`` so the UI can tag non-starter models, but loading is
+    allowed for ANY GGUF — the router applies the right per-family
+    sampling automatically. With PINNED_ONLY = True the verdict becomes
+    a hard 400 rejection at the load gate (the v2.3 single-model contract).
     """
     arch = (profile.architecture or "").lower()
     quant_blob = ((profile.quantization or "") + " " + profile.filename).upper()
     param_blob = ((profile.param_count_estimate or "") + " " + profile.filename).upper()
     if arch != PINNED_ARCH:
         return (
-            f"Architecture '{profile.architecture}' is not the tuned target "
-            "(Gemma 4 12B Q4_K_M). It loads fine, but sampling and prompts "
-            "fall back to the generic profile."
+            f"Not the starter model: architecture '{profile.architecture}'. "
+            "The recommended starter is Gemma 4 12B Instruct (Q4_K_M)."
         )
     if "Q4_K_M" not in quant_blob:
         return (
-            f"Quantization '{profile.quantization}' is not the tuned target "
-            "(Q4_K_M). Quality/speed may differ from the tuned numbers."
+            f"Not the starter quantization: '{profile.quantization}'. "
+            "The recommended starter is Gemma 4 12B Instruct Q4_K_M."
         )
     if "12B" not in param_blob:
         return (
-            f"Size '{profile.param_count_estimate}' is not the tuned target "
-            "(12B). Fine to run, just not the benchmarked configuration."
+            f"Not the starter size: '{profile.param_count_estimate}'. "
+            "The recommended starter is Gemma 4 12B Instruct (Q4_K_M)."
         )
     return None
+
+
+def _require_pinned_target(profile) -> None:
+    """HTTP load gate. Only enforces the pin when PINNED_ONLY is set."""
+    if not PINNED_ONLY:
+        return
+    err = pinned_target_error(profile)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
 
 
 @router.get("/info")
@@ -120,8 +135,8 @@ async def model_info() -> ModelInfo:
     compatible = None
     compatible_error = None
     if path:
-        # Pinned-target verdict comes from the cached router inspect (single
-        # source shared with the load gate).
+        # Pinned-target verdict for /info. In universal mode this only tags
+        # the model (starter vs other); nothing is rejected.
         try:
             profile = get_router().inspect(path)
             architecture = profile.architecture
@@ -169,12 +184,20 @@ async def load_model(req: LoadRequest) -> dict:
     decision to the router's plan; explicit values override it and are
     still verified against real memory before the load ladder runs.
 
-    Any GGUF architecture is accepted (Gemma 4 12B Q4_K_M is the tuned
-    default, not a requirement). The runtime still keeps exactly one
-    Llama alive - the previous model is replaced.
+    The swap runs under the global lifecycle lock and the previous model
+    is unloaded explicitly first: orphaning a live Llama would leave its
+    C-level free to a random GC pass, which can segfault the server later
+    (typically during the NEXT load - the classic "swap crashes the app"
+    bug).
     """
     if not os.path.exists(req.path):
         raise HTTPException(status_code=404, detail=f"File not found: {req.path}")
+
+    # An explicit device choice (agent load dialog's GPU toggle) is
+    # remembered so the startup auto-load uses the same device next time.
+    if req.use_gpu is not None:
+        from ggufloader.api.auto_load import remember_device_preference
+        remember_device_preference(req.use_gpu)
 
     try:
         try:
@@ -183,22 +206,27 @@ async def load_model(req: LoadRequest) -> dict:
             raise HTTPException(status_code=400, detail=f"Unknown role: {req.role}")
 
         router = get_router()
-        # Any GGUF is allowed here: the pinned Gemma 4 12B Q4_K_M is the
-        # tuned default, not a hard requirement (hussainnazary2's build is
-        # a local-model testing ground). The runtime rule that still holds
-        # is "one Llama at a time" - router.load replaces the current one.
-        backend, profile, strategy, _config = router.load(
-            req.path,
-            role,
-            n_ctx=req.n_ctx,
-            use_gpu=req.use_gpu,
-            n_gpu_layers=req.n_gpu_layers,
-        )
-        set_model_backend(backend)
-        # Remember where this model came from so the next startup scans
-        # that folder too (the file may live far from the default models
-        # dir - e.g. an external drive).
-        remember_model_dir(str(Path(req.path).parent))
+        # Load gate: no-op in universal mode (default); hard pin when
+        # PINNED_ONLY = True (metadata-only inspect, cached).
+        _require_pinned_target(router.inspect(req.path))
+        with model_lifecycle_lock():
+            # Free the previous model deterministically BEFORE constructing
+            # the new one (unload() closes + gc.collects under our feet).
+            previous = get_model_backend()
+            if previous is not None:
+                try:
+                    previous.unload()
+                except Exception as e:  # noqa: BLE001 - freeing is best-effort
+                    logger.warning("Failed to unload previous model: %s", e)
+                set_model_backend(None)
+            backend, profile, strategy, _config = router.load(
+                req.path,
+                role,
+                n_ctx=req.n_ctx,
+                use_gpu=req.use_gpu,
+                n_gpu_layers=req.n_gpu_layers,
+            )
+            set_model_backend(backend)
         return {
             "status": "loaded",
             "path": req.path,
@@ -224,8 +252,17 @@ async def load_model(req: LoadRequest) -> dict:
 
 @router.delete("/unload")
 async def unload_model() -> dict:
-    """Unload the current model."""
-    set_model_backend(None)
+    """Unload the current model (deterministically, under the lifecycle lock)."""
+    with model_lifecycle_lock():
+        backend = get_model_backend()
+        if backend is not None:
+            try:
+                backend.unload()
+            except Exception as e:  # noqa: BLE001 - freeing is best-effort
+                logger.warning("Unload raised: %s", e)
+        set_model_backend(None)
+    # Auto-load state must not keep claiming "loaded" now that it is gone.
+    reset_auto_load()
     return {"status": "unloaded"}
 
 

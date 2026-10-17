@@ -22,6 +22,8 @@ export interface AppInfo {
   version: string
   label: string
   tagline: string
+  /** Universal mode: any GGUF loads (true unless the backend sets PINNED_ONLY). */
+  universal?: boolean
   pinned: {
     arch: string
     quant: string

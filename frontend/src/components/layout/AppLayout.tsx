@@ -11,6 +11,7 @@ import { AriaLive } from '../ui/AriaLive'
 import { OfflineIndicator } from '../ui/OfflineIndicator'
 import { UpdatePanel } from '../ui/UpdatePanel'
 import { NotificationPanel } from '../ui/NotificationPanel'
+import { HardwareHUD } from '../ui/HardwareHUD'
 import { useUIStore } from '../../stores/uiStore'
 import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts'
 import { useAccessibilityShortcuts } from '../../hooks/useAccessibility'
@@ -63,6 +64,8 @@ export function AppLayout() {
       </div>
       {/* Mobile bottom navigation */}
       <MobileNav />
+      {/* Live hardware HUD — RAM/CPU/GPU always visible in recordings */}
+      {!isMobile && <HardwareHUD />}
       <CommandPalette />
       <CompatibilityDialog />
       <OfflineIndicator />

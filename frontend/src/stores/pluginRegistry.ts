@@ -29,6 +29,10 @@ const DEFAULT_PLUGINS: SidebarPlugin[] = [
   { id: 'config', label: 'Config', icon: 'Sliders', category: 'core', description: 'Agent configuration and presets', enabled: true, order: 2 },
   { id: 'settings', label: 'Settings', icon: 'Settings', category: 'core', description: 'Application settings', enabled: true, order: 3 },
 
+  // Model studio (local AI experiments)
+  { id: 'hfbrowser', label: 'Models', icon: 'Globe', category: 'model', description: 'Browse and download GGUF models from HuggingFace', enabled: true, order: 10 },
+  { id: 'testing', label: 'Test', icon: 'FlaskConical', category: 'model', description: 'Model testing studio - speed-race multiple models with a live leaderboard', enabled: true, order: 11 },
+
   // Agent
   { id: 'templates', label: 'Prompts', icon: 'Copy', category: 'agent', description: 'Prompt templates and management', enabled: false, order: 20 },
   { id: 'diff', label: 'Diff', icon: 'FileCode', category: 'agent', description: 'File diff viewer for agent changes', enabled: false, order: 21 },

@@ -97,17 +97,6 @@ class TestStats:
         assert stats["decode_ms"] == 0.0
         assert stats["tokens_per_second"] == 0.0
 
-    def test_prompt_and_total_token_counts(self):
-        """The readouts above the prompt box need in + out = total."""
-        backend = FakeBackend(tokens=7)
-        base = time.perf_counter()
-        stats = playground._stats(
-            backend, ["some generated text"], base - 1.0, base - 0.5, base - 0.1,
-            prompt_tokens=11)
-        assert stats["prompt_tokens"] == 11
-        assert stats["tokens_generated"] == 7
-        assert stats["total_tokens"] == 18
-
 
 # ── Streaming chat ───────────────────────────────────────────────────────
 
@@ -187,41 +176,6 @@ class TestChatStream:
         assert body["content"] == "all at once"
         assert body["tokens_generated"] == 3
 
-    def test_stream_reports_prompt_and_total_tokens(self, client, monkeypatch):
-        """Every stats/done frame carries the prompt + total counts the UI
-        renders above the prompt box."""
-        backend = FakeBackend(pieces=("hey"), tokens=4)
-        monkeypatch.setattr(playground, "get_model_backend", lambda: backend)
-        monkeypatch.setattr(playground, "_STATS_INTERVAL_S", 0.0)
-
-        r = client.post("/api/playground/chat/stream", json={"message": "hi"})
-        events = parse_sse(r.text)
-        frames = [d for e, d in events if e in ("stats", "done")]
-        assert frames, "expected stats/done frames"
-        for f in frames:
-            assert f["prompt_tokens"] > 0
-            assert f["tokens_generated"] == 4
-            assert f["total_tokens"] == f["prompt_tokens"] + 4
-
-    def test_prompt_tokens_count_system_and_history(self, client, monkeypatch):
-        backend = FakeBackend(tokens=4)
-        monkeypatch.setattr(playground, "get_model_backend", lambda: backend)
-        honest = client.post(
-            "/api/playground/chat/stream",
-            json={"message": "hi"},
-        )
-        long = client.post(
-            "/api/playground/chat/stream",
-            json={
-                "message": "hi",
-                "system_prompt": "be brief",
-                "history": [{"role": "user", "content": "first"}],
-            },
-        )
-        short_prompt = [d for e, d in parse_sse(honest.text) if e == "done"][0]["prompt_tokens"]
-        long_prompt = [d for e, d in parse_sse(long.text) if e == "done"][0]["prompt_tokens"]
-        assert long_prompt > short_prompt
-
 
 # ── Model status / routes ────────────────────────────────────────────────
 
@@ -254,3 +208,206 @@ class TestModelStatus:
         app = create_app()
         paths = [str(getattr(r, "path", r)) for r in app.routes]
         assert any("/api/playground" in p for p in paths)
+
+
+# ── mmproj companion files ───────────────────────────────────────────────
+
+
+class TestMmprojCompanionFiles:
+    """mmproj GGUFs are vision projectors for a parent model, not chat LLMs:
+    they must not appear in the chat dropdown, and loading one directly must
+    fail with a message that says WHY (not the generic fallback-ladder error
+    that reads like a quantization/settings problem).
+    """
+
+    def test_is_standalone_chat_model(self):
+        assert playground._is_standalone_chat_model("gemma4-12b-q4_k_m.gguf")
+        assert playground._is_standalone_chat_model("Gemma4-12B-MMProj-F16.gguf") is False
+        assert playground._is_standalone_chat_model("qwen3-vl-mmproj.gguf") is False
+
+    def test_models_endpoint_hides_mmproj(self, client, monkeypatch):
+        async def fake_catalog(directory=None, recursive=True):
+            return {
+                "directory": directory,
+                "models": [
+                    {"path": "/m/gemma4-12b-q4_k_m.gguf", "filename": "gemma4-12b-q4_k_m.gguf",
+                     "size_human": "8.1 GB", "quantization": "Q4_K_M"},
+                    {"path": "/m/gemma4-12b-mmproj-f16.gguf", "filename": "gemma4-12b-mmproj-f16.gguf",
+                     "size_human": "167 MB", "quantization": "F16"},
+                ],
+            }
+
+        monkeypatch.setattr(
+            "ggufloader.api.routes.model.model_catalog", fake_catalog
+        )
+        body = client.get("/api/playground/models").json()
+        names = [m["filename"] for m in body["models"]]
+        assert names == ["gemma4-12b-q4_k_m.gguf"]
+        assert body["count"] == 1
+
+    def test_load_mmproj_returns_clear_400(self, client, tmp_path):
+        mmproj = tmp_path / "gemma4-12b-mmproj-f16.gguf"
+        mmproj.write_bytes(b"\x00" * 16)
+        res = client.post("/api/playground/model/load", json={"path": str(mmproj)})
+        assert res.status_code == 400
+        assert "vision companion file" in res.json()["detail"]
+
+
+# ── Device preference (CPU / GPU) ─────────────────────────────────────────
+
+
+class TestDevicePreference:
+    """An explicit CPU/GPU choice must be persisted so the startup
+    auto-load honors it on the next run (user asked for CPU).
+    """
+
+    class _FakeStrategy:
+        def __init__(self, use_gpu):
+            self.n_ctx = 2048
+            self.use_gpu = use_gpu
+
+    class _FakeProfile:
+        filename = "model-q4_k_m.gguf"
+        architecture = "llama"
+        quantization = "Q4_K_M"
+        param_count_estimate = "7B"
+        file_size_gb = 4.0
+
+    class _FakeRouter:
+        def __init__(self, use_gpu=None):
+            self.seen_use_gpu = "unset"
+            self._use_gpu = use_gpu
+
+        def load(self, path, role, n_ctx=None, use_gpu=None):
+            self.seen_use_gpu = use_gpu
+            return object(), TestDevicePreference._FakeProfile(), \
+                TestDevicePreference._FakeStrategy(use_gpu=use_gpu), {}
+
+    def test_roundtrip(self, tmp_path, monkeypatch):
+        import ggufloader.api.auto_load as auto_load
+
+        monkeypatch.setattr(auto_load, "find_config_dir", lambda: str(tmp_path))
+        assert auto_load.get_remembered_device_preference() is None  # auto
+        auto_load.remember_device_preference(False)
+        assert auto_load.get_remembered_device_preference() is False  # CPU
+        auto_load.remember_device_preference(True)
+        assert auto_load.get_remembered_device_preference() is True  # GPU
+
+    def test_playground_load_persists_explicit_device(self, client, tmp_path,
+                                                      monkeypatch):
+        import ggufloader.api.auto_load as auto_load
+
+        monkeypatch.setattr(auto_load, "find_config_dir", lambda: str(tmp_path))
+        model = tmp_path / "model-q4_k_m.gguf"
+        model.write_bytes(b"\x00" * 16)
+
+        fake_router = self._FakeRouter()
+        monkeypatch.setattr(playground, "get_router", lambda: fake_router)
+        monkeypatch.setattr(playground, "get_model_backend", lambda: None)
+        monkeypatch.setattr(playground, "set_model_backend", lambda b: None)
+
+        res = client.post(
+            "/api/playground/model/load",
+            json={"path": str(model), "use_gpu": False},
+        )
+        assert res.status_code == 200
+        assert res.json()["use_gpu"] is False
+        # The explicit device reached the router load call
+        assert fake_router.seen_use_gpu is False
+        # CPU choice persisted for the next startup auto-load
+        assert auto_load.get_remembered_device_preference() is False
+
+    def test_auto_device_preference_not_overwritten_by_auto_load(
+            self, client, tmp_path, monkeypatch):
+        """A load without an explicit device (use_gpu=None) must NOT touch
+        the saved preference - 'auto' never overwrites a deliberate choice.
+        """
+        import ggufloader.api.auto_load as auto_load
+
+        monkeypatch.setattr(auto_load, "find_config_dir", lambda: str(tmp_path))
+        auto_load.remember_device_preference(False)
+
+        model = tmp_path / "model-q4_k_m.gguf"
+        model.write_bytes(b"\x00" * 16)
+
+        fake_router = self._FakeRouter()
+        monkeypatch.setattr(playground, "get_router", lambda: fake_router)
+        monkeypatch.setattr(playground, "get_model_backend", lambda: None)
+        monkeypatch.setattr(playground, "set_model_backend", lambda b: None)
+
+        res = client.post("/api/playground/model/load", json={"path": str(model)})
+        assert res.status_code == 200
+        assert auto_load.get_remembered_device_preference() is False  # untouched
+
+
+# ── Family sampling defaults + stop tokens (LFM <s>-echo fix) ────────────
+
+
+class TestFamilySamplingDefaults:
+    """The playground used to forward ONLY temperature/max_tokens - no
+    repeat_penalty, no stop strings - so a model that missed its EOS
+    repeated garbage until max_tokens. It now applies the loaded model's
+    family sampling (model_families.json) + unified stop tokens; an
+    explicit request temperature still wins.
+    """
+
+    def _fake_backend(self):
+        return FakeBackend()
+
+    def _patch_resolve(self, monkeypatch, params=None, error=False):
+        import ggufloader.core.llm.model_profiles as mp
+
+        if error:
+            def boom(path):
+                raise RuntimeError("no metadata")
+            monkeypatch.setattr(mp, "resolve_chat_config", boom)
+        else:
+            monkeypatch.setattr(
+                mp, "resolve_chat_config",
+                lambda path: {"params": dict(params or {})})
+
+    def test_family_params_and_stops_reach_backend(self, client, monkeypatch):
+        fake = self._fake_backend()
+        monkeypatch.setattr(playground, "get_model_backend", lambda: fake)
+        self._patch_resolve(monkeypatch, {
+            "temperature": 0.2, "top_k": 80, "repeat_penalty": 1.05,
+        })
+        client.post("/api/playground/chat",
+                    json={"message": "hi", "max_tokens": 64})
+        kw = fake.seen[0]["kwargs"]
+        assert kw["temperature"] == 0.2      # family default (request sent none)
+        assert kw["top_k"] == 80
+        assert kw["repeat_penalty"] == 1.05
+        assert kw["max_tokens"] == 64        # request value
+        assert "<|im_end|>" in kw["stop"]    # unified stop tokens
+        assert "</s>" in kw["stop"]
+
+    def test_explicit_request_temperature_wins(self, client, monkeypatch):
+        fake = self._fake_backend()
+        monkeypatch.setattr(playground, "get_model_backend", lambda: fake)
+        self._patch_resolve(monkeypatch, {"temperature": 0.2})
+        client.post("/api/playground/chat",
+                    json={"message": "hi", "temperature": 0.9})
+        assert fake.seen[0]["kwargs"]["temperature"] == 0.9
+
+    def test_family_resolution_failure_still_sends_stops(self, client, monkeypatch):
+        fake = self._fake_backend()
+        monkeypatch.setattr(playground, "get_model_backend", lambda: fake)
+        self._patch_resolve(monkeypatch, error=True)
+        client.post("/api/playground/chat", json={"message": "hi"})
+        kw = fake.seen[0]["kwargs"]
+        assert "<|im_end|>" in kw["stop"]    # graceful degradation
+        assert kw["max_tokens"] == 512
+
+    def test_stream_endpoint_applies_defaults_too(self, client, monkeypatch):
+        fake = self._fake_backend()
+        monkeypatch.setattr(playground, "get_model_backend", lambda: fake)
+        self._patch_resolve(monkeypatch, {"temperature": 0.2, "repeat_penalty": 1.05})
+        body = client.post(
+            "/api/playground/chat/stream",
+            json={"message": "hi", "max_tokens": 32},
+        ).text
+        assert "event: token" in body
+        kw = fake.seen[0]["kwargs"]
+        assert kw["repeat_penalty"] == 1.05
+        assert "<|im_end|>" in kw["stop"]

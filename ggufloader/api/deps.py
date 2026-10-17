@@ -7,6 +7,7 @@ connects to these via REST/WebSocket without needing Qt.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Optional
 
 from ggufloader.core.llm.model_backend import ModelBackend
@@ -19,6 +20,24 @@ _model_backend: Optional[ModelBackend] = None
 _workspace: Optional[str] = None
 _router: Optional[ModelRouter] = None
 
+# Serializes EVERY model lifecycle transition (load / swap / unload) across
+# all threads. Without this, the startup auto-load worker racing a user load
+# from the UI could run two Llama() constructors (plus a destructor) at the
+# same time - a reliable recipe for a llama.cpp segfault that kills the
+# server with no traceback. An RLock so a load route can safely call helper
+# functions that also acquire it.
+_model_lifecycle_lock = threading.RLock()
+
+
+def model_lifecycle_lock() -> threading.RLock:
+    """The global lock guarding load/swap/unload of the model backend.
+
+    Routes must hold this for the WHOLE swap (old.unload() -> router.load()
+    -> set_model_backend(new)) so at most one Llama is ever being created or
+    destroyed at a time.
+    """
+    return _model_lifecycle_lock
+
 
 def get_model_backend() -> Optional[ModelBackend]:
     """Get the currently loaded model backend."""
@@ -26,7 +45,12 @@ def get_model_backend() -> Optional[ModelBackend]:
 
 
 def set_model_backend(backend: Optional[ModelBackend]) -> None:
-    """Set the model backend after loading."""
+    """Set the model backend after loading.
+
+    Callers replacing an existing backend should first unload it explicitly
+    (under :func:`model_lifecycle_lock`) - orphaning a live Llama leaves its
+    C-level free to a random GC pass, which can crash the process later.
+    """
     global _model_backend
     _model_backend = backend
     if backend:

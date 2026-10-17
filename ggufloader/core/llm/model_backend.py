@@ -13,6 +13,7 @@ isolation and reused from any worker thread.
 
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 from typing import Any, Dict, Iterator, List, Optional
@@ -114,7 +115,14 @@ class ModelBackend:
         self._use_mmap = use_mmap
         self._rope_freq_base = rope_freq_base
         self._llama: Any = None
-        self._lock = threading.Lock()
+        # RLock (reentrant): chat_stream holds the lock for the whole stream
+        # lifetime, and the playground's live `stats` events count tokens
+        # (count_tokens re-acquires) from the SAME thread mid-stream. A plain
+        # Lock deadlocked there - the stream froze after ~0.25s and every
+        # later model operation (including loading) hung forever. Cross-thread
+        # serialization is preserved: other threads still block until the
+        # stream finishes.
+        self._lock = threading.RLock()
         # A3: KV prefix cache — stores last prompt tokens + state snapshot
         # for reusing the longest common prefix across turns.
         self._kv_cache_tokens: Optional[List[int]] = None
@@ -155,13 +163,60 @@ class ModelBackend:
         )
         if self._rope_freq_base:
             llama_kwargs["rope_freq_base"] = self._rope_freq_base
+        # Chat-format hint for TEMPLATE-LESS GGUFs. llama-cpp-python's
+        # fallback for files without ``tokenizer.chat_template`` is the
+        # llama-2 format (``<s>[INST] ... [/INST]``) - catastrophically
+        # wrong for ChatML-style models: an LFM2.5 file that way degenerated
+        # into echoing ``<s>hi</s> <s>world</s>`` loops. When the GGUF has
+        # no embedded template but the detected family knows its format
+        # (see model_families.json "chat_format"), pass it explicitly.
+        # Files WITH a template (or unknown families) are untouched.
+        try:
+            from ggufloader.core.llm.model_profiles import (
+                detect_family,
+                read_gguf_general_metadata,
+            )
+            meta = read_gguf_general_metadata(self.model_path)
+            if not meta.get("chat_template"):
+                family_profile, _how = detect_family(meta, self.model_path)
+                chat_format = family_profile.get("chat_format") or ""
+                if chat_format:
+                    llama_kwargs["chat_format"] = chat_format
+                    logger.info(
+                        "GGUF has no embedded chat template; using family "
+                        "chat format %r for %s", chat_format, self.model_path,
+                    )
+        except Exception as e:  # noqa: BLE001 - never block a load on this
+            logger.debug("Chat-format hint lookup failed: %s", e)
         self._llama = Llama(**llama_kwargs)
         return self
 
     def unload(self) -> None:
-        """Release the model and free GPU/CPU memory."""
+        """Release the model and free CPU/GPU memory - deterministically.
+
+        Simply dropping the reference (the old behaviour) leaves the actual
+        ``llama_free`` to a *random* later GC pass. When that pass runs inside
+        the next ``Llama(...)`` construction, or on a background thread while
+        another context exists, llama.cpp can segfault and take the whole
+        server down - which is exactly what killed model swaps in the chat
+        (playground) tab. Instead: close explicitly and collect right here,
+        at a controlled point where nothing else is being constructed.
+        """
         with self._lock:
+            llama = self._llama
             self._llama = None
+        if llama is None:
+            return
+        try:
+            close = getattr(llama, "close", None)
+            if callable(close):
+                close()
+        except Exception:  # noqa: BLE001 - freeing is best-effort
+            logger.debug("Llama.close() raised during unload", exc_info=True)
+        del llama
+        # Run the destructor NOW (this thread, nothing else constructing)
+        # instead of at an arbitrary allocation site later.
+        gc.collect()
 
     @property
     def is_loaded(self) -> bool:

@@ -110,6 +110,11 @@ class HFService:
             query: Search terms (empty = trending GGUF models)
             sort: Sort order: "likes", "downloads", "lastModified"
             limit: Max results (default 20, max 50)
+
+        Note: the Hub API stopped returning the repo file list (siblings)
+        in plain search responses — ``expand[]=siblings`` is required, and
+        per-file sizes are NOT included (fetch them lazily via
+        ``get_file_info`` when the user expands a repo).
         """
         limit = min(limit, 50)
         params = {
@@ -117,11 +122,12 @@ class HFService:
             "sort": sort,
             "direction": "-1",
             "limit": str(limit),
+            "expand[]": ["siblings", "downloads", "likes"],
         }
         if query:
             params["search"] = query
 
-        url = f"{HF_API_BASE}?{urllib.parse.urlencode(params)}"
+        url = f"{HF_API_BASE}?{urllib.parse.urlencode(params, doseq=True)}"
         logger.info("HF search: %s", url)
 
         try:
@@ -307,8 +313,9 @@ class HFService:
             progress.status = "error"
             if on_progress:
                 on_progress(progress)
-            # Clean up partial file on error
-            tmp.unlink(missing_ok=True)
+            # Keep the partial .part file so an interrupted multi-GB
+            # download can resume via HTTP Range on the next attempt
+            # (same contract as the pinned-model downloader).
             raise RuntimeError(f"Download failed: {e}") from e
 
     def _verify_hash(

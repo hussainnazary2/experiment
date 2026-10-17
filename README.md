@@ -9,6 +9,62 @@ leaves your machine.
 
 ---
 
+## 🎬 v2.4.2 — Your Local AI Experiment Studio (chat-tab fixes)
+
+> The single-model restriction is **gone**. Load *any* GGUF, discover new
+> models in-app, race them against each other, and capture it all with live
+> stats burned into the frame — built for people who share what local AI
+> can do.
+
+### What's new in v2.4.2
+
+- 🐛 **Chatbot tab fixed** — chatting in the Chatbot tab used to freeze
+  after ~0.25s and then block all model loads (a lock deadlock between the
+  streaming chat and its live tok/s stats; the Agent tab was unaffected).
+  Fixed, plus model swaps are now fully serialized and unload memory is
+  freed deterministically — no more random crashes when switching models.
+- 📁 **Chat tab finds your models** — the Chatbot model picker now
+  remembers the same models folder as the Agent picker and has its own
+  Browse button, so it no longer shows an empty list when your GGUFs live
+  outside the default folder. GPU auto-detection is used for chat loads
+  too (CPU can still be forced).
+
+### What's new in v2.4.1
+
+- 🌐 **Universal model loader** — any GGUF loads. 9 family profiles
+  (Gemma, Llama, Qwen, Mistral, Phi, DeepSeek, TinyLlama, SmolLM) with
+  per-family sampling from each model card. The pinned Gemma 4 12B Q4_K_M
+  stays available as a one-click *starter model*.
+- 🔎 **HuggingFace model browser** (Models panel) — search GGUF repos
+  (trending by default), sort by likes/downloads/recency, expand a repo to
+  see every file with its **real size and quant badge** (Q4 "balanced",
+  Q8 "lossless", …), download with **live progress + speed + resume**, then
+  **Load** it without leaving the app.
+- 🏁 **Model Testing Studio** (Test panel) — speed-race several GGUF models
+  back-to-back on CPU or GPU: a **live leaderboard** ranks them by
+  tokens/sec as they finish, with TTFT, load time and per-prompt detail.
+  Export any run as JSON / Markdown / CSV.
+- 📊 **Live hardware HUD** — a floating widget shows RAM, CPU, GPU
+  utilization and the loaded model's memory footprint in real time, so a
+  recording always shows what the machine is doing.
+- ⏺ **One-click REC** — record the app window straight from the chatbot:
+  the live stats overlay (model, tok/s, tokens, TTFT, RAM/CPU/GPU, "100%
+  local") is rendered *inside* the frame. Perfect for Instagram Reels and
+  YouTube Shorts.
+- 🧪 **Speed chatbot** — the default center view streams replies token by
+  token with four big readouts: tokens/sec, tokens generated,
+  time-to-first-token, elapsed.
+
+### Screenshot tour
+
+| Chatbot + stat cards + REC + Hardware HUD | HuggingFace model browser |
+|---|---|
+| ![Chatbot](screenshots/studio-chatbot.png) | ![Models](screenshots/studio-models.png) |
+| Testing Studio | Agent mode |
+| ![Testing](screenshots/studio-testing.png) | ![Agent](screenshots/screen2.png) |
+
+---
+
 ## 🧪 v2.3.0 — Testing Release (Single-Model Agent)
 
 > ⚠️ **This is a testing/preview release.** It is locked to one model while
@@ -70,10 +126,9 @@ CUDA runtime; the CPU build is several times smaller.
 
 ## 🔮 What's Coming Next
 
-> **Universal Model Loader returns** — the next release removes the single-model
-> restriction. You'll be able to run **any GGUF model** with the agent, with
-> hardware-aware recommendations so you can pick a model that fits your PC's
-> RAM/VRAM.
+> **Deeper experiment tooling** — prompt suites for quality scoring,
+> side-by-side model comparison in one screen, and shareable benchmark
+> cards you can export as images for social posts.
 
 ---
 

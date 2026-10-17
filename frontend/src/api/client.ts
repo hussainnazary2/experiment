@@ -170,6 +170,8 @@ export const filesApi = {
 export const gpuApi = {
   status: () => request<any>('/gpu/status'),
   install: () => request<any>('/gpu/install', { method: 'POST' }),
+  /** Live hardware telemetry (RAM/CPU/process RSS/GPU) - poll ~1 Hz. */
+  live: () => request<any>('/gpu/live'),
 }
 
 // Templates API
@@ -307,34 +309,6 @@ export const benchmarkApi = {
     }),
 }
 
-// Model testing studio API - multi-model speed runs at /api/benchmark/suite/*.
-// The panel that consumes this is not wired into the UI yet, but the client
-// is its contract: without it `tsc -b` fails for the whole app.
-export const testingApi = {
-  /** The fixed prompt workload every model in a run gets. */
-  prompts: () => request<any[]>('/benchmark/suite/prompts'),
-  /** Candidate GGUFs on disk. */
-  models: (directory?: string) =>
-    request<any>(`/benchmark/suite/models${directory ? `?directory=${encodeURIComponent(directory)}` : ''}`),
-  /** Past test runs. */
-  runs: (limit = 20) => request<any[]>(`/benchmark/suite/runs?limit=${limit}`),
-  runDetail: (runId: string) => request<any>(`/benchmark/suite/runs/${encodeURIComponent(runId)}`),
-  /** Live run status (poll while a run is in flight). */
-  status: () => request<any>('/benchmark/suite/status'),
-  /** Start a run over the selected models. */
-  run: (opts: {
-    paths: string[]
-    device?: string
-    prompt_ids?: string[] | null
-    max_tokens?: number | null
-    n_ctx?: number | null
-  }) => request<any>('/benchmark/suite/run', { method: 'POST', body: JSON.stringify(opts) }),
-  cancel: () => request<any>('/benchmark/suite/cancel', { method: 'POST' }),
-  /** Download URL for a finished run's report (json | markdown | csv). */
-  exportUrl: (runId: string, format: 'json' | 'markdown' | 'csv' = 'json') =>
-    `/api/benchmark/suite/runs/${encodeURIComponent(runId)}/export?format=${format}`,
-}
-
 // Playground API - plain streaming chatbot for showing model speed.
 // No agent involved: load a model, chat, and read live tokens/sec off the stream.
 export const playgroundApi = {
@@ -342,7 +316,7 @@ export const playgroundApi = {
   models: (directory?: string) =>
     request<any>(`/playground/models${directory ? `?directory=${encodeURIComponent(directory)}` : ''}`),
   /** Load a GGUF (any GGUF - the pinned gate is bypassed here). */
-  load: (path: string, useGpu = false, nCtx: number | null = null) =>
+  load: (path: string, useGpu: boolean | null = null, nCtx: number | null = null) =>
     request<any>('/playground/model/load', {
       method: 'POST', body: JSON.stringify({ path, use_gpu: useGpu, n_ctx: nCtx }),
     }),
@@ -402,6 +376,81 @@ export const playgroundApi = {
       }
     }
   },
+}
+
+// Testing Studio API - multi-model speed comparison suite
+// (backend: /api/benchmark/suite/*)
+export const testingApi = {
+  /** The fixed prompt workload every model runs. */
+  prompts: () => request<any[]>('/benchmark/suite/prompts'),
+  /** Candidate GGUF models found on disk. */
+  models: (directory?: string) =>
+    request<any>(`/benchmark/suite/models${directory ? `?directory=${encodeURIComponent(directory)}` : ''}`),
+  /** Start a test run over the selected models. */
+  run: (opts: { paths: string[]; device?: 'cpu' | 'gpu'; prompt_ids?: string[]; max_tokens?: number | null; n_ctx?: number | null }) =>
+    request<any>('/benchmark/suite/run', { method: 'POST', body: JSON.stringify(opts) }),
+  /** Live status of the current (or last) run. */
+  status: () => request<any>('/benchmark/suite/status'),
+  cancel: () => request<any>('/benchmark/suite/cancel', { method: 'POST' }),
+  /** Saved runs, newest first. */
+  runs: (limit = 20) => request<any[]>(`/benchmark/suite/runs?limit=${limit}`),
+  runDetail: (id: string) => request<any>(`/benchmark/suite/runs/${id}`),
+  /** Direct URL for exporting a saved run. */
+  exportUrl: (id: string, format: 'json' | 'markdown' | 'csv' = 'json') =>
+    `/api/benchmark/suite/runs/${encodeURIComponent(id)}/export?format=${format}`,
+}
+
+// HuggingFace model browser API - search, download (background + resume), local files
+export const hfApi = {
+  /** Search GGUF repos on HuggingFace (empty q = trending). */
+  search: (q: string, sort: 'likes' | 'downloads' | 'lastModified' = 'likes', limit = 20) =>
+    request<{ models: HFModel[]; query: string; sort: string }>(
+      `/hf/search?q=${encodeURIComponent(q)}&sort=${sort}&limit=${limit}`),
+  /** Size/etag for one repo file. */
+  fileInfo: (repoId: string, filePath: string) =>
+    request<{ size: number; etag: string; url: string }>(
+      `/hf/file-info?repo_id=${encodeURIComponent(repoId)}&file_path=${encodeURIComponent(filePath)}`),
+  /** Batch size lookup for a repo's GGUF files (call when expanding a card). */
+  filesInfo: (repoId: string, filePaths: string[]) =>
+    request<{ repo_id: string; files: Record<string, { size: number; etag: string; url: string }> }>('/hf/files-info', {
+      method: 'POST',
+      body: JSON.stringify({ repo_id: repoId, file_paths: filePaths }),
+    }),
+  /** Start a background download into the models folder (resume-capable). */
+  download: (repoId: string, filePath: string) =>
+    request<{ status: string }>('/hf/download', {
+      method: 'POST',
+      body: JSON.stringify({ repo_id: repoId, file_path: filePath }),
+    }),
+  /** Live download progress (bytes, speed, status) - poll ~1 Hz. */
+  downloadStatus: () => request<HFDownloadStatus>('/hf/download/status'),
+  cancelDownload: () => request<any>('/hf/download/cancel', { method: 'POST' }),
+  /** GGUF files already in the models folder. */
+  local: () => request<{ models: { path: string; filename: string; size_bytes: number; size_gb: number }[]; models_dir: string }>('/hf/local'),
+}
+
+/** A GGUF repo on HuggingFace. */
+export interface HFModel {
+  repo_id: string
+  model_name: string
+  likes: number
+  downloads: number
+  description: string
+  gguf_files: { path: string; size: number }[]
+}
+
+/** Live HF download progress snapshot. */
+export interface HFDownloadStatus {
+  status: 'idle' | 'downloading' | 'verifying' | 'done' | 'error' | 'cancelled'
+  repo_id: string | null
+  file_path: string | null
+  bytes_downloaded: number
+  total_bytes: number
+  speed_bps: number
+  elapsed_secs: number
+  path: string | null
+  error: string | null
+  models_dir?: string
 }
 
 // Workspace API

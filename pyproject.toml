@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ggufloader"
-version = "2.4.0"
+version = "2.4.2"
 description = "Advanced GGUF Model Loader with Smart Floating Assistant"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -67,4 +67,4 @@ ggufloader = "ggufloader.main:main"
 include = ["ggufloader*"]
 
 [tool.setuptools.package-data]
-ggufloader = ["*.ico", "*.png", "config/*.json"]
+ggufloader = ["*.ico", "*.png"]

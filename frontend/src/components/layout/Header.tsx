@@ -3,19 +3,24 @@ import { useModelStore } from '../../stores/modelStore'
 import { useDownloadStore } from '../../stores/downloadStore'
 import { useUIStore } from '../../stores/uiStore'
 import { modelApi, gpuApi } from '../../api/client'
-import { PanelLeftClose, PanelRightClose, Cpu, X, Download } from 'lucide-react'
+import { PanelLeftClose, PanelRightClose, Cpu, X, Download, Globe } from 'lucide-react'
 import { NotificationBell } from '../ui/NotificationPanel'
 import { useUpdateStore } from '../../stores/updateStore'
 
 export function Header() {
   const { info } = useModelStore()
   const dl = useDownloadStore((s) => s.dl)
-  const { toggleLeftPanel, toggleRightPanel } = useUIStore()
+  const { toggleLeftPanel, toggleRightPanel, setRightPanelTab, rightPanelOpen } = useUIStore()
   const [gpuOk, setGpuOk] = useState<boolean | null>(null)
 
   useEffect(() => {
     gpuApi.status().then(s => setGpuOk(s.gpu_available)).catch(() => setGpuOk(false))
   }, [])
+
+  const openModelBrowser = () => {
+    setRightPanelTab('hfbrowser')
+    if (!rightPanelOpen) toggleRightPanel()
+  }
 
   // Once the downloaded model is actually loaded, retire the download
   // indicator so a later unload shows the plain "No model" chip again.
@@ -51,11 +56,20 @@ export function Header() {
         {/* Notifications */}
         <NotificationBell />
 
+        {/* Model browser shortcut */}
+        <button
+          onClick={openModelBrowser}
+          title="Browse & download GGUF models from HuggingFace"
+          className="p-1.5 text-text-sec hover:text-accent hover:bg-elevated rounded-lg transition-colors"
+        >
+          <Globe size={15} />
+        </button>
+
         {/* Model chip — compact */}
         <div
           className={`flex items-center gap-1.5 px-2.5 py-1 bg-elevated rounded-full border border-border text-xs ${dl?.status === 'downloading' ? 'border-accent/40' : ''}`}
           title={dl?.status === 'downloading'
-            ? `Downloading Gemma 4 12B Q4_K_M — ${Math.round(dl.progress * 100)}%`
+            ? `Downloading model — ${Math.round(dl.progress * 100)}%`
             : (dl?.status === 'error' ? `Download failed: ${dl.message || ''}` : undefined)}
         >
           {dl?.status === 'downloading' ? (

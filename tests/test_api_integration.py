@@ -27,14 +27,16 @@ class TestHealthEndpoint:
 
 
 class TestAppInfoEndpoint:
-    def test_app_info_returns_pinned_identity(self, client):
+    def test_app_info_returns_universal_identity(self, client):
         resp = client.get("/api/app/info")
         assert resp.status_code == 200
         data = resp.json()
         assert data["name"] == "GGUF Loader"
         assert "version" in data
-        assert data["label"] == "Gemma 4 12B Q4_K_M"
-        assert data["tagline"] == "Optimized for Gemma 4 12B Q4_K_M"
+        # Universal mode: any GGUF loads; the pinned block only describes
+        # the recommended starter model.
+        assert data["universal"] is True
+        assert "any GGUF" in data["tagline"]
         assert data["pinned"] == {"arch": "gemma4", "quant": "Q4_K_M", "size": "12B"}
 
 

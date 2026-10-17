@@ -139,8 +139,8 @@ def test_estimate_memory_no_layers():
 # ---------------------------------------------------------------------------
 
 def test_router_inspect_llama_model(tmp_path):
-    """Non-Gemma files are no longer tuned: they resolve to generic and are
-    rejected at the load gate (single-model app pinned to Gemma 4)."""
+    """Llama files resolve to the llama family and get its per-family
+    tuning (universal mode: any GGUF loads)."""
     kvs = (
         _kv_str("general.architecture", "llama")
         + _kv_str("general.name", "Llama-3-8B-Instruct")
@@ -154,7 +154,7 @@ def test_router_inspect_llama_model(tmp_path):
     profile = router.inspect(str(p))
 
     assert profile.architecture == "llama"
-    assert profile.family == "generic"
+    assert profile.family == "llama"
     assert profile.trained_context == 8192
     assert profile.total_layers == 32
     assert profile.is_embedding_model is False
@@ -325,7 +325,7 @@ def test_quick_profile(tmp_path):
     qp = router.quick_profile(str(p))
 
     assert qp["architecture"] == "llama"
-    assert qp["family"] == "generic"  # only gemma4 is a real family now
+    assert qp["family"] == "llama"  # families detected per file (universal mode)
     assert qp["is_embedding"] is False
     assert "filename" in qp
 
@@ -342,7 +342,7 @@ def test_router_handles_minimal_gguf(tmp_path):
     profile = router.inspect(str(p))
 
     assert profile.architecture == "qwen3"
-    assert profile.family == "generic"  # only gemma4 is a real family now
+    assert profile.family == "qwen"  # families detected per file (universal mode)
     assert profile.total_layers == 0  # not set
     assert profile.trained_context == 0
 

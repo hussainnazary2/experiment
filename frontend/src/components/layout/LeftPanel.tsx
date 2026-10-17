@@ -20,7 +20,6 @@ import {
 } from 'lucide-react'
 import { sessionApi, modelApi, appApi } from '../../api/client'
 import { useModelStore } from '../../stores/modelStore'
-import { toast } from '../../stores/toastStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
 import { ModelLoadDialog } from '../model/ModelLoadDialog'
@@ -167,10 +166,8 @@ export function LeftPanel() {
       await useModelStore.getState().loadModel(modelPath)
       const refreshedInfo = await modelApi.info()
       setModelInfo(refreshedInfo)
-    } catch (e: any) {
-      // A rejected load used to disappear silently here.
-      toast.error(e?.message || 'Failed to load model')
-    }
+      setLoadingModel(null)
+    } catch {}
     setLoadingModel(null)
   }
 
@@ -325,12 +322,8 @@ export function LeftPanel() {
                   <div className="min-w-0 flex-1">
                     <div className="text-[11px] text-text-sec truncate font-mono">{model.filename}</div>
                     <div className="flex items-center gap-1 text-[9px] text-text-muted">
-                      {(model.profile?.family || model.family) && (
-                        <span>{model.profile?.family || model.family}</span>
-                      )}
-                      {(model.profile?.quantization || model.quantization) && (
-                        <span>· {model.profile?.quantization || model.quantization}</span>
-                      )}
+                      {model.profile?.family && <span>{model.profile.family}</span>}
+                      {model.profile?.quantization && <span>· {model.profile.quantization}</span>}
                       {model.size_gb && <span>· {model.size_gb} GB</span>}
                     </div>
                   </div>

@@ -687,12 +687,6 @@ class ModelRouter:
         from ggufloader.core.llm.model_profiles import detect_family
         family_profile, detected_via = detect_family(meta, path)
 
-        # Quantization + context come from the same header read, so a file
-        # picker can show them without a second parse. (They used to be
-        # missing here, which is why the catalog's model list always showed
-        # an empty quantization column.)
-        quant, _quant_tier = _detect_quantization(p.name, meta)
-
         return {
             "path": str(p),
             "filename": p.name,
@@ -702,8 +696,6 @@ class ModelRouter:
             "family_label": family_profile.get("label", "Generic"),
             "detected_via": detected_via,
             "size_tier": _size_tier_from_gb(file_gb).value,
-            "quantization": quant,
-            "context_length": _extract_uint(meta, arch, "context_length"),
             "param_estimate": _param_estimate_from_filename(p.name) or _param_estimate_from_size(file_gb),
             "is_embedding": _is_embedding_model(arch, name, meta.get("basename", "")),
             "is_vision": _is_vision_model(arch, name, meta.get("basename", ""), meta),

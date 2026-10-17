@@ -1,16 +1,15 @@
-"""Startup auto-load of a local GGUF.
+"""Startup auto-load of the best available GGUF model.
 
-The app is tuned for Gemma 4 12B Q4_K_M, so that is what this module
-prefers - but it is no longer the only thing that can load. When no
-pinned GGUF is on disk the newest GGUF of *any* architecture is loaded,
-so the UI still opens with a working model instead of an empty chat.
+Universal mode (default): the model should be ready when the UI opens,
+with no manual "Load Model" step. This module:
 
 1. Remembers the directory a model was last loaded from (config dir JSON),
    so an existing GGUF keeps working across app restarts without moving it.
-2. Scans that directory plus the default models folder for a GGUF that
-   passes the pinned-target gate, falling back to the newest GGUF present.
-3. Loads the candidate in a background thread (server stays responsive
-   while an 8 GB model loads) and publishes state that the
+2. Scans that directory plus the default models folder. The starter model
+   (Gemma 4 12B Q4_K_M) wins if present; otherwise the newest loadable
+   GGUF is picked — any architecture loads in universal mode.
+3. Loads the best candidate in a background thread (server stays
+   responsive while an 8 GB model loads) and publishes state that the
    ``/api/model/info`` endpoint surfaces to the UI.
 
 Auto-load never blocks or crashes startup: failures become a status the
@@ -29,7 +28,12 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ggufloader.api.deps import get_model_backend, get_router, set_model_backend
+from ggufloader.api.deps import (
+    get_model_backend,
+    get_router,
+    model_lifecycle_lock,
+    set_model_backend,
+)
 from ggufloader.config import (
     PINNED_MODEL_FILENAME,
     PINNED_MODEL_URL,
@@ -49,6 +53,7 @@ _state: Dict[str, Optional[str]] = {
 _worker: Optional[threading.Thread] = None
 
 _STATUS_FILENAME = "model_auto_load.json"
+_DEVICE_FILENAME = "device_preference.json"
 _ENV_DIR_OVERRIDE = "GGUFLOADER_MODELS_DIR"
 _ENV_SKIP = "GGUFLOADER_SKIP_AUTOLOAD"
 
@@ -100,6 +105,38 @@ def get_remembered_model_dir() -> Optional[str]:
     return None
 
 
+def remember_device_preference(use_gpu: bool) -> None:
+    """Persist the user's CPU/GPU choice (best-effort, never raises).
+
+    Written whenever a load is requested with an EXPLICIT device - from
+    the chat tab's CPU/GPU toggle or the agent load dialog - so that the
+    NEXT startup auto-load runs the model on the same device the user
+    picked. Auto (no preference yet) is never overwritten.
+    """
+    try:
+        cfg = Path(find_config_dir())
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / _DEVICE_FILENAME).write_text(
+            json.dumps({"use_gpu": bool(use_gpu)}), encoding="utf-8")
+        logger.info("Remembered device preference: %s", "GPU" if use_gpu else "CPU")
+    except OSError as e:  # read-only fs, etc. — never block a load on this
+        logger.warning("Could not remember device preference: %s", e)
+
+
+def get_remembered_device_preference() -> Optional[bool]:
+    """The user's saved device choice: True=GPU, False=CPU, None=auto."""
+    try:
+        cfg = Path(find_config_dir()) / _DEVICE_FILENAME
+        if cfg.is_file():
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            v = data.get("use_gpu")
+            if isinstance(v, bool):
+                return v
+    except (OSError, ValueError) as e:
+        logger.debug("Could not read device preference: %s", e)
+    return None
+
+
 def _default_models_dir() -> str:
     paths = get_paths()
     if "models" in paths:
@@ -124,27 +161,50 @@ def _candidate_dirs() -> List[str]:
 
 
 def _is_pinned(profile) -> Optional[str]:
-    """Return an error message if ``profile`` is not the tuned target.
+    """Return None when ``profile`` IS the starter target, else a reason.
 
-    Delegates to the HTTP-route verdict (``api/routes/model.py``) so the
-    two can never drift; imported lazily because that module imports this
-    one at module level.
+    Mirrors the HTTP verdict in ``api/routes/model.py``. Used only to
+    PREFER the starter model during scans — other models load fine in
+    universal mode, they just lose the tie-break.
     """
-    from ggufloader.api.routes.model import pinned_target_error
-    return pinned_target_error(profile)
+    arch = (profile.architecture or "").lower()
+    quant_blob = ((profile.quantization or "") + " " + profile.filename).upper()
+    param_blob = ((profile.param_count_estimate or "") + " " + profile.filename).upper()
+    if arch != "gemma4":
+        return f"architecture '{profile.architecture}'"
+    if "Q4_K_M" not in quant_blob:
+        return f"quantization '{profile.quantization}'"
+    if "12B" not in param_blob:
+        return f"size '{profile.param_count_estimate}'"
+    return None
 
 
-def _find_model_file(dirs: List[str]):
-    """Scan directories for the GGUF to auto-load.
+def _is_loadable(profile) -> bool:
+    """True when a GGUF is a runnable chat model (universal mode).
 
-    Prefers the newest GGUF passing the pinned-target gate (Gemma 4 12B
-    Q4_K_M); when none exists, falls back to the newest GGUF of any
-    architecture rather than leaving the app modelless. Returns
-    (path, profile) or (None, None). Inspect is metadata-only (cached by
+    Excludes embedding-only files; everything else (any architecture,
+    any quant) is fair game — the router picks per-family sampling.
+    """
+    arch = (profile.architecture or "").lower()
+    name_blob = (getattr(profile, "filename", "") or "").lower()
+    if arch in ("nomic-bert", "bert", "jina-bert", "jina-bert-v2"):
+        return False
+    if "embed" in name_blob or "embedding" in name_blob:
+        return False
+    return True
+
+
+def _find_best_file(dirs: List[str]):
+    """Scan directories for the best GGUF to auto-load.
+
+    Preference order: the starter model (Gemma 4 12B Q4_K_M) when present,
+    otherwise the newest loadable GGUF. Inspect is metadata-only (cached by
     the router), so this is fast even for large files.
+
+    Returns (path, profile) or (None, None).
     """
     router = get_router()
-    pinned = None
+    starter = None
     newest = None
     for d in dirs:
         root = Path(d)
@@ -157,14 +217,17 @@ def _find_model_file(dirs: List[str]):
             except Exception as e:
                 logger.debug("Skipping unreadable GGUF %s: %s", p, e)
                 continue
-            mtime = p.stat().st_mtime
-            if newest is None or mtime > newest[2]:
-                newest = (p, profile, mtime)
             if _is_pinned(profile) is None:
-                if pinned is None or mtime > pinned[2]:
-                    pinned = (p, profile, mtime)
-    best = pinned or newest
-    return (best[0], best[1]) if best else (None, None)
+                if starter is None or p.stat().st_mtime > starter[0].stat().st_mtime:
+                    starter = (p, profile)
+                continue
+            if not _is_loadable(profile):
+                continue
+            if newest is None:
+                newest = (p, profile)
+    if starter is not None:
+        return starter
+    return newest if newest else (None, None)
 
 
 def _in_test_env() -> bool:
@@ -180,30 +243,43 @@ def _worker_run() -> None:
     try:
         dirs = _candidate_dirs()
         logger.info("Auto-load scan: %s", dirs)
-        path, _profile = _find_model_file(dirs)
+        path, _profile = _find_best_file(dirs)
         if path is None:
             with _lock:
                 _state.update({
                     "status": "not_found",
                     "message": "No GGUF model found in models folder(s): "
                                + ", ".join(dirs or ["<none>"])
-                               + ". Gemma 4 12B Q4_K_M is the tuned target.",
+                               + ". Drop a .gguf file there, or download one "
+                                 "from the Models browser.",
                     "path": None,
                 })
             return
 
-        # Re-check under the lock: a manual load may have won the race.
+        # Publish "loading" BEFORE taking the lifecycle lock so the UI shows
+        # progress while the (possibly long) GGUF mmap warm-up runs.
         with _lock:
             if get_model_backend() is not None:
                 _state.update({"status": "loaded", "message": None, "path": str(path)})
                 return
             _state.update({"status": "loading", "message": None, "path": str(path)})
 
+        # The whole load+set runs under the global lifecycle lock: a user
+        # load arriving from the UI mid-startup must never run a second
+        # Llama() constructor concurrently with this one (segfault race).
         from ggufloader.core.router import ModelRole
-        backend, _profile, _strategy, _config = get_router().load(
-            str(path), ModelRole.CHAT)
-        set_model_backend(backend)
-        remember_model_dir(str(Path(path).parent))
+        # Honor a saved CPU/GPU choice: a user who switched the chat tab
+        # (or agent dialog) to CPU shouldn't get GPU again on restart.
+        use_gpu = get_remembered_device_preference()
+        with model_lifecycle_lock():
+            # Re-check under the lifecycle lock: a manual load may have won.
+            if get_model_backend() is not None:
+                _state.update({"status": "loaded", "message": None, "path": str(path)})
+                return
+            backend, _profile, _strategy, _config = get_router().load(
+                str(path), ModelRole.CHAT, use_gpu=use_gpu)
+            set_model_backend(backend)
+            remember_model_dir(str(Path(path).parent))
         with _lock:
             _state.update({
                 "status": "loaded",
